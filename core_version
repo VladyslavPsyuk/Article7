@@ -1,0 +1,262 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ==========================================
+# 1. INPUT DATA FROM TABLE
+# ==========================================
+plants = pd.DataFrame({
+    "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+    "Qcapt": [1.80, 1.42, 0.40, 2.457],         # mln t/year
+    "P_elec": [36, 70, 51, 96],                # €/MWh
+    "P_CO2": [83, 83, 83, 83],                 # €/t
+    "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+    "OPEX_spec": [30, 30, 30, 30]              # €/t
+})
+
+S = 0
+eta_actual = 0.90
+
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+plants["Phi_calc"] = (
+    plants["P_CO2"] + S - plants["E_spec_Pelec_table"] - plants["OPEX_spec"]
+)
+plants["F_calc"] = plants["Qcapt"] * plants["Phi_calc"]
+
+print("--- Plants Input Table ---")
+print(plants)
+
+# ==========================================
+# 2. GRID CONFIGURATION
+# ==========================================
+eta = np.linspace(0.10, 0.95, 300)
+Pco2 = np.linspace(30, 150, 300)
+ETA, PCO2 = np.meshgrid(eta, Pco2)
+
+# ==========================================
+# 3. CREATE PLOTS & SENSITIVITY FOR EACH PLANT
+# ==========================================
+for _, row in plants.iterrows():
+    plant = row["Plant"]
+    Qmax = row["Qcapt"] / eta_actual
+    P_elec_val = row["P_elec"]
+    E0_val = row["E0"]
+    OPEX_fixed = row["OPEX_spec"] * row["Qcapt"]
+    P_CO2_val = row["P_CO2"]  # base CO2 price for local calculations
+
+    # --------------------------------------
+    # 3D MODEL MESH GENERATION
+    # --------------------------------------
+    Qcapt = ETA * Qmax
+    E_spec = E0_val / (1 - ETA)
+    OPEX_spec_mesh = OPEX_fixed / (ETA * Qmax)
+    Phi = PCO2 + S - E_spec * P_elec_val - OPEX_spec_mesh
+    F = ETA * Qmax * Phi
+
+    # Optimal Point for F
+    idx_F = np.unravel_index(np.argmax(F), F.shape)
+    eta_F_opt = ETA[idx_F]
+    Pco2_F_opt = PCO2[idx_F]
+    Phi_F_opt = Phi[idx_F]
+    F_opt = F[idx_F]
+
+    # Optimal Point for Phi
+    idx_Phi = np.unravel_index(np.argmax(Phi), Phi.shape)
+    eta_Phi_opt = ETA[idx_Phi]
+    Pco2_Phi_opt = PCO2[idx_Phi]
+    Phi_opt = Phi[idx_Phi]
+    F_at_Phi_opt = F[idx_Phi]
+
+    # Minimum Functional Line (Phi = 0 and F = 0)
+    Pco2_break_even = (
+        E0_val / (1 - eta) * P_elec_val + OPEX_fixed / (eta * Qmax) - S
+    )
+    valid_break_even = (
+        (Pco2_break_even >= Pco2.min()) & (Pco2_break_even <= Pco2.max())
+    )
+
+    # Minimum Functional Point (lowest CO2 price where F >= 0)
+    feasible_mask = (F >= 0)
+    if np.any(feasible_mask):
+        feasible_indices = np.where(feasible_mask)
+        min_idx_position = np.argmin(PCO2[feasible_indices])
+        i_min = feasible_indices[0][min_idx_position]
+        j_min = feasible_indices[1][min_idx_position]
+        eta_min_func = ETA[i_min, j_min]
+        Pco2_min_func = PCO2[i_min, j_min]
+        Phi_min_func = Phi[i_min, j_min]
+        F_min_func = F[i_min, j_min]
+    else:
+        eta_min_func = np.nan
+        Pco2_min_func = np.nan
+        Phi_min_func = np.nan
+        F_min_func = np.nan
+
+    print(f"\n==========================================")
+    print(f"PLANT: {plant}")
+    print(f"==========================================")
+    print(f"Maximum F point: η = {eta_F_opt:.3f}, P_CO2 = {Pco2_F_opt:.2f}, F = {F_opt:.2f}")
+    print(f"Maximum Φ point: η = {eta_Phi_opt:.3f}, P_CO2 = {Pco2_Phi_opt:.2f}, Φ = {Phi_opt:.2f}")
+    print(f"Minimum functional point: η = {eta_min_func:.3f}, P_CO2 = {Pco2_min_func:.2f}, F = {F_min_func:.2f}")
+# --------------------------------------
+    # PLOT 1: PHI SURFACE
+    # --------------------------------------
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    surface = ax.plot_surface(
+        ETA, PCO2, Phi, cmap="viridis", edgecolor="black", linewidth=0.15, alpha=0.85
+    )
+    ax.plot(
+        eta[valid_break_even], Pco2_break_even[valid_break_even], np.zeros_like(eta[valid_break_even]),
+        color="blue", linewidth=3, label="Minimum functional line Φ = 0"
+    )
+    ax.scatter(eta_Phi_opt, Pco2_Phi_opt, Phi_opt, color="green", marker="^", s=120, label="Maximum Φ point")
+    ax.scatter(eta_F_opt, Pco2_F_opt, Phi_F_opt, color="black", s=100, label="Maximum F point")
+    if not np.isnan(eta_min_func):
+        ax.scatter(eta_min_func, Pco2_min_func, Phi_min_func, color="blue", s=100, label="Minimum functional point")
+    
+    ax.plot(eta, np.full_like(eta, Pco2_F_opt), Phi[np.argmin(abs(Pco2 - Pco2_F_opt)), :], color="black", linewidth=2, label="Line at max F CO₂ price")
+    ax.plot(np.full_like(Pco2, eta_F_opt), Pco2, Phi[:, np.argmin(abs(eta - eta_F_opt))], color="red", linewidth=2, label="Line at max F η")
+    ax.set_title(f"{plant}: Surface of Φ")
+    ax.set_xlabel("Capture efficiency η")
+    ax.set_ylabel("CO₂ price, €/t")
+    ax.set_zlabel("Φ, €/t")
+    ax.legend()
+    fig.colorbar(surface, shrink=0.5, aspect=10)
+    plt.show()
+
+    # --------------------------------------
+    # PLOT 2: F SURFACE
+    # --------------------------------------
+    fig = plt.figure(figsize=(10, 5))
+    ax = fig.add_subplot(111, projection="3d")
+    surface = ax.plot_surface(
+        ETA, PCO2, F, cmap="plasma", edgecolor="black", linewidth=0.15, alpha=0.85
+    )
+    ax.plot(
+        eta[valid_break_even], Pco2_break_even[valid_break_even], np.zeros_like(eta[valid_break_even]),
+        color="blue", linewidth=3, label="Minimum functional line F = 0"
+    )
+    ax.scatter(eta_Phi_opt, Pco2_Phi_opt, F_at_Phi_opt, color="green", marker="^", s=120, label="Maximum Φ point")
+    ax.scatter(eta_F_opt, Pco2_F_opt, F_opt, color="black", s=100, label="Maximum F point")
+    if not np.isnan(eta_min_func):
+        ax.scatter(eta_min_func, Pco2_min_func, F_min_func, color="blue", s=100, label="Minimum functional point")
+    
+    ax.plot(eta, np.full_like(eta, Pco2_F_opt), F[np.argmin(abs(Pco2 - Pco2_F_opt)), :], color="black", linewidth=2, label="Line at max F CO₂ price")
+    ax.plot(np.full_like(Pco2, eta_F_opt), Pco2, F[:, np.argmin(abs(eta - eta_F_opt))], color="red", linewidth=2, label="Line at max F η")
+    ax.set_title(f"{plant}: Surface of F")
+    ax.set_xlabel("Capture efficiency η")
+    ax.set_ylabel("CO₂ price, €/t")
+    ax.set_zlabel("F, mln €/year")
+    ax.legend()
+    fig.colorbar(surface, shrink=0.5, aspect=10)
+    plt.show()
+
+    # --------------------------------------
+    # PLOT 3: CONTOUR MAP OF F
+    # --------------------------------------
+    plt.figure(figsize=(8, 5))
+    contour = plt.contourf(ETA, PCO2, F, levels=40, cmap="plasma")
+    plt.colorbar(contour, label="F, mln €/year")
+    plt.plot(eta[valid_break_even], Pco2_break_even[valid_break_even], color="blue", linewidth=3, label="Minimum functional line F = 0")
+    plt.scatter(eta_F_opt, Pco2_F_opt, color="black", s=100, label="Maximum F point")
+    plt.scatter(eta_Phi_opt, Pco2_Phi_opt, color="green", marker="^", s=120, label="Maximum Φ point")
+    if not np.isnan(eta_min_func):
+        plt.scatter(eta_min_func, Pco2_min_func, color="blue", s=100, label="Minimum functional point")
+    plt.axvline(eta_F_opt, color="black", linestyle="--", linewidth=2)
+    plt.axhline(Pco2_F_opt, color="black", linestyle=":", linewidth=2)
+    plt.title(f"{plant}: Contour map of F")
+    plt.xlabel("Capture efficiency η")
+    plt.ylabel("CO₂ price, €/t")
+    plt.legend()
+    plt.grid(True)
+    plt.show()# --------------------------------------
+    # SENSITIVITY CALCULATIONS (FOR THE SPECIFIC PLANT)
+    # --------------------------------------
+    # Using actual baseline parameters for this specific plant
+    Phi_base = row["Phi_calc"]
+    
+    # Raw Partial Derivatives evaluated at base points
+    dPhi_dPCO2 = 1.0
+    dPhi_deta = -(E0_val * P_elec_val) / (1 - eta_actual)**2 + OPEX_fixed / (eta_actual**2 * Qmax)
+    dPhi_dPelec = -E0_val / (1 - eta_actual)
+    dPhi_dE0 = -P_elec_val / (1 - eta_actual)
+    dPhi_dOPEX = -1.0 / (eta_actual * Qmax)
+    dPhi_dQmax = OPEX_fixed / (eta_actual * Qmax**2)
+
+    labels = [
+        r'$\partial \Phi/\partial P_{CO2}$',
+        r'$\partial \Phi/\partial \eta$',
+        r'$\partial \Phi/\partial P_{elec}$',
+        r'$\partial \Phi/\partial E_0$',
+        r'$\partial \Phi/\partial OPEX$',
+        r'$\partial \Phi/\partial Q_{max}$'
+    ]
+    
+    sens_values = [dPhi_dPCO2, dPhi_deta, dPhi_dPelec, dPhi_dE0, dPhi_dOPEX, dPhi_dQmax]
+
+    # Normalized Elasticity Calculations
+    S_PCO2  = dPhi_dPCO2 * P_CO2_val / Phi_base
+    S_eta   = dPhi_deta * eta_actual / Phi_base
+    S_Pelec = dPhi_dPelec * P_elec_val / Phi_base
+    S_E0    = dPhi_dE0 * E0_val / Phi_base
+    S_OPEX  = dPhi_dOPEX * OPEX_fixed / Phi_base
+    S_Qmax  = dPhi_dQmax * Qmax / Phi_base
+
+    elasticities = [S_PCO2, S_eta, S_Pelec, S_E0, S_OPEX, S_Qmax]
+
+    # --------------------------------------
+    # PLOT 4: LOCAL SENSITIVITY BAR CHART
+    # --------------------------------------
+    plt.figure(figsize=(9, 4.5))
+    bars1 = plt.bar(labels, sens_values, color='skyblue', edgecolor='black')
+    plt.axhline(0, color='black', linewidth=1)
+    plt.ylabel("Sensitivity coefficient")
+    plt.title(f"{plant}: Local Sensitivity Analysis of Φ")
+    plt.xticks(rotation=25)
+    for bar in bars1:
+        y = bar.get_height()
+        va_dir = 'bottom' if y >= 0 else 'top'
+        plt.text(bar.get_x() + bar.get_width()/2, y, f'{y:.2f}', ha='center', va=va_dir)
+    plt.tight_layout()
+    plt.show()
+
+    # --------------------------------------
+    # PLOT 5: ELASTICITY SENSITIVITY BAR CHART
+    # --------------------------------------
+    plt.figure(figsize=(9, 4.5))
+    bars2 = plt.bar(labels, elasticities, color='salmon', edgecolor='black')
+    plt.axhline(0, color='black', linewidth=1)
+    plt.ylabel("Normalized sensitivity")
+    plt.title(f"{plant}: Elasticity-based Sensitivity Analysis (Normalized)")
+    plt.xticks(rotation=25)
+    for bar in bars2:
+        y = bar.get_height()
+        va_dir = 'bottom' if y >= 0 else 'top'
+        plt.text(bar.get_x() + bar.get_width()/2, y, f'{y:.2f}', ha='center', va=va_dir)
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================
+# 4. FINAL COMPARISON SUMMARY
+# ==========================================
+x = np.arange(len(plants))
+
+plt.figure(figsize=(8, 4))
+plt.bar(x, plants["Phi_calc"], color='teal')
+plt.axhline(0, color="black", linewidth=1)
+plt.xticks(x, plants["Plant"])
+plt.ylabel("Φ, €/t")
+plt.title("Comparison of Base Φ by Plant")
+plt.grid(axis="y", linestyle='--')
+plt.show()
+
+plt.figure(figsize=(8, 4))
+plt.bar(x, plants["F_calc"], color='crimson')
+plt.axhline(0, color="black", linewidth=1)
+plt.xticks(x, plants["Plant"])
+plt.ylabel("F, mln €/year")
+plt.title("Comparison of Base F by Plant")
+plt.grid(axis="y", linestyle='--')
+plt.show()
