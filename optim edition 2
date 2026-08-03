@@ -1,0 +1,377 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ==========================================
+# 1. INPUT DATA & PLANT COEFFICIENTS
+# ==========================================
+plants = pd.DataFrame(
+    {
+        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
+        "P_elec": [36, 70, 51, 96],  # €/MWh
+        "P_CO2": [83, 83, 83, 83],  # €/t
+        "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+        "OPEX_spec": [30, 30, 30, 30],  # €/t
+    }
+)
+
+S = 0.0  # Carbon subsidy (€/t)
+eta_actual = 0.90  # Base capture efficiency
+
+# Compute plant specific baseline parameters
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+
+
+# ==========================================
+# 2. CORE REGRESSION MODEL (Econometric Base)
+# ==========================================
+def calculate_plant_financials(
+    eta_val, p_co2_val, p_elec_val, opex_spec_val, plant_row, subsidy=0.0
+):
+    """Calculates absolute financials (Revenue, Costs, Profit) in EUR/year."""
+    Qmax = plant_row["Qcapt"] / eta_actual
+
+    capacity = Qmax
+    labor_hours = 12000 * Qmax
+    total_cement_prod = eta_val * Qmax * 1.5
+    num_kilns = 2.0
+    pct_masonry, pct_4_or_other, pct_wet = 0.15, 0.20, 0.05
+
+    beta0, beta1, beta2, beta3 = 0.80, -0.04, 0.02, 0.12
+    beta4, beta5, beta6, beta7 = 0.05, -0.08, 0.03, 0.15
+
+    E_i = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(total_cement_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    ref_prod = eta_actual * Qmax * 1.5
+    E_i_ref = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(ref_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    target_E_spec = plant_row["E_spec"]
+    E_spec_m = (
+        target_E_spec
+        * (E_i / E_i_ref)
+        * (1.0 + 0.45 * (eta_val / eta_actual - 1.0))
+    )
+
+    # Volume captured (tons/year)
+    Q_captured_tons = eta_val * Qmax * 1e6
+
+    # Financial Components (€/year)
+    Revenue = Q_captured_tons * (p_co2_val + subsidy)
+    Electricity_Cost = Q_captured_tons * E_spec_m * p_elec_val
+    Fixed_Opex = opex_spec_val * plant_row["Qcapt"] * 1e6
+    Total_Cost = Electricity_Cost + Fixed_Opex
+
+    Profit = Revenue - Total_Cost
+
+    return {
+        "Revenue": Revenue,
+        "Total_Cost": Total_Cost,
+        "Elec_Cost": Electricity_Cost,
+        "Fixed_Opex": Fixed_Opex,
+        "Profit": Profit,
+        "E_spec": E_spec_m,
+    }
+
+
+# ==========================================
+# 3. ABSOLUTE FINITE-DIFFERENCE & RELATIVE ANALYSIS
+# ==========================================
+print("\n" + "=" * 80)
+print("1. FINITE-DIFFERENCE EFFECTS (EUR/year) & RELATIVE IMPACT (% Revenue/Cost)")
+print("=" * 80)
+
+delta = 0.05  # 5% perturbation step size
+fd_results = []
+
+for _, row in plants.iterrows():
+    plant_name = row["Plant"]
+    base_eta = 0.90
+    base_pco2 = row["P_CO2"]
+    base_pelec = row["P_elec"]
+    base_opex = row["OPEX_spec"]
+
+    base_fin = calculate_plant_financials(
+        base_eta, base_pco2, base_pelec, base_opex, row
+    )
+    F_base = base_fin["Profit"]
+    Rev_base = base_fin["Revenue"]
+    Cost_base = base_fin["Total_Cost"]
+
+    # Parameter Perturbations
+    params_to_test = {
+        "CO2 Price (P_CO2)": (
+            base_eta,
+            base_pco2 * (1 + delta),
+            base_pelec,
+            base_opex,
+        ),
+        "Electricity Price (P_elec)": (
+            base_eta,
+            base_pco2,
+            base_pelec * (1 + delta),
+            base_opex,
+        ),
+        "OPEX Spec": (
+            base_eta,
+            base_pco2,
+            base_pelec,
+            base_opex * (1 + delta),
+        ),
+        "Capture Efficiency (eta)": (
+            base_eta * (1 + delta),
+            base_pco2,
+            base_pelec,
+            base_opex,
+        ),
+    }
+
+    for param_name, (e, p_c, p_e, o) in params_to_test.items():
+        fin_pert = calculate_plant_financials(e, p_c, p_e, o, row)
+        F_pert = fin_pert["Profit"]
+
+        # 1. Absolute Finite-Difference Effect (EUR/year)
+        abs_diff_eur = F_pert - F_base
+
+        # 2. Percentage Changes relative to Revenue and Total Cost
+        pct_of_revenue = (abs_diff_eur / Rev_base) * 100
+        pct_of_total_cost = (abs_diff_eur / Cost_base) * 100
+
+        fd_results.append(
+            {
+                "Plant": plant_name,
+                "Parameter (+5%)": param_name,
+                "Absolute Effect (€/year)": round(abs_diff_eur, 2),
+                "% of Total Revenue": round(pct_of_revenue, 2),
+                "% of Total Cost": round(pct_of_total_cost, 2),
+            }
+        )
+
+df_fd = pd.DataFrame(fd_results)
+print(df_fd.to_string(index=False))
+
+
+# ==========================================
+# 4. STANDARDIZED SCENARIO RANGES
+# ==========================================
+print("\n" + "=" * 80)
+print("2. STANDARDIZED SCENARIO EVALUATION")
+print("=" * 80)
+
+scenarios_def = {
+    "Base Case": {"P_CO2": 83.0, "P_elec_mult": 1.0, "OPEX_mult": 1.0},
+    "High Carbon / Low Energy": {
+        "P_CO2": 120.0,
+        "P_elec_mult": 0.8,
+        "OPEX_mult": 1.0,
+    },
+    "Low Carbon / High Energy": {
+        "P_CO2": 45.0,
+        "P_elec_mult": 1.3,
+        "OPEX_mult": 1.1,
+    },
+    "Sorbent Cost Spike": {"P_CO2": 83.0, "P_elec_mult": 1.0, "OPEX_mult": 1.4},
+}
+
+scenario_results = []
+for _, row in plants.iterrows():
+    for sc_name, sc_params in scenarios_def.items():
+        p_c = sc_params["P_CO2"]
+        p_e = row["P_elec"] * sc_params["P_elec_mult"]
+        o_s = row["OPEX_spec"] * sc_params["OPEX_mult"]
+
+        fin = calculate_plant_financials(0.90, p_c, p_e, o_s, row)
+
+        scenario_results.append(
+            {
+                "Plant": row["Plant"],
+                "Scenario": sc_name,
+                "Profit (Mln €/yr)": round(fin["Profit"] / 1e6, 3),
+                "Revenue (Mln €/yr)": round(fin["Revenue"] / 1e6, 3),
+                "Total Cost (Mln €/yr)": round(fin["Total_Cost"] / 1e6, 3),
+            }
+        )
+
+df_scenarios = pd.DataFrame(scenario_results)
+print(df_scenarios.pivot(index="Plant", columns="Scenario", values="Profit (Mln €/yr)").to_string())
+
+
+# ==========================================
+# 5. GLOBAL SENSITIVITY ANALYSIS (MORRIS METHOD)
+# ==========================================
+print("\n" + "=" * 80)
+print("3. GLOBAL SENSITIVITY ANALYSIS (MORRIS ELEMENTARY EFFECTS)")
+print("=" * 80)
+
+
+def morris_screening(plant_row, num_trajectories=100, num_levels=4):
+    """Calculates Elementary Effects: mu* (absolute mean) and sigma (interactions/non-linearity)."""
+    # Normalized bounds [Min, Max]
+    param_bounds = {
+        "eta": [0.50, 0.95],
+        "P_CO2": [40.0, 140.0],
+        "P_elec": [30.0, 120.0],
+        "OPEX_spec": [15.0, 45.0],
+    }
+
+    param_names = list(param_bounds.keys())
+    k = len(param_names)
+    ee_store = {p: [] for p in param_names}
+
+    grid_step = num_levels / (2 * (num_levels - 1))
+
+    for _ in range(num_trajectories):
+        # Base random point scaled to grid
+        x_base = np.zeros(k)
+        for i, (p, bounds) in enumerate(param_bounds.items()):
+            grid_points = np.linspace(bounds[0], bounds[1], num_levels)
+            x_base[i] = np.random.choice(grid_points)
+
+        # Base evaluation
+        p_dict = dict(zip(param_names, x_base))
+        fin_base = calculate_plant_financials(
+            p_dict["eta"],
+            p_dict["P_CO2"],
+            p_dict["P_elec"],
+            p_dict["OPEX_spec"],
+            plant_row,
+        )
+        y_base = fin_base["Profit"] / 1e6  # Mln € scale
+
+        # Perturb each dimension independently
+        for i, p_name in enumerate(param_names):
+            x_pert = np.copy(x_base)
+            delta_val = (
+                param_bounds[p_name][1] - param_bounds[p_name][0]
+            ) * grid_step
+
+            # Keep step within bounds
+            if x_pert[i] + delta_val <= param_bounds[p_name][1]:
+                x_pert[i] += delta_val
+                step_actual = delta_val
+            else:
+                x_pert[i] -= delta_val
+                step_actual = -delta_val
+
+            p_dict_pert = dict(zip(param_names, x_pert))
+            fin_pert = calculate_plant_financials(
+                p_dict_pert["eta"],
+                p_dict_pert["P_CO2"],
+                p_dict_pert["P_elec"],
+                p_dict_pert["OPEX_spec"],
+                plant_row,
+            )
+            y_pert = fin_pert["Profit"] / 1e6
+
+            # Elementary effect calculation
+            ee = (y_pert - y_base) / (step_actual / (param_bounds[p_name][1] - param_bounds[p_name][0]))
+            ee_store[p_name].append(ee)
+
+    morris_summary = []
+    for p_name in param_names:
+        effects = np.array(ee_store[p_name])
+        mu_star = np.mean(np.abs(effects))
+        sigma = np.std(effects)
+        morris_summary.append(
+            {
+                "Parameter": p_name,
+                "mu_star (Impact Strength)": round(mu_star, 3),
+                "sigma (Non-Linearity/Interaction)": round(sigma, 3),
+            }
+        )
+
+    return pd.DataFrame(morris_summary)
+
+
+# Execute Morris Analysis for Swiss Plant as baseline
+df_morris = morris_screening(plants.iloc[0])
+print(f"Morris Screening Results for Plant: {plants.iloc[0]['Plant']}")
+print(df_morris.to_string(index=False))
+
+
+# ==========================================
+# 6. VISUALIZATION OF SENSITIVITIES
+# ==========================================
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+# Plot 1: Percentage Impact Relative to Revenue & Costs (FD Analysis)
+swiss_fd = df_fd[df_fd["Plant"] == "Swiss"]
+x = np.arange(len(swiss_fd["Parameter (+5%)"]))
+width = 0.35
+
+ax1.bar(
+    x - width / 2,
+    swiss_fd["% of Total Revenue"],
+    width,
+    label="% of Total Revenue",
+    color="#1f77b4",
+    edgecolor="black",
+)
+ax1.bar(
+    x + width / 2,
+    swiss_fd["% of Total Cost"],
+    width,
+    label="% of Total Cost",
+    color="#ff7f0e",
+    edgecolor="black",
+)
+ax1.set_title(
+    "Swiss Plant: Relative Sensitivity to +5% Parameter Shift", fontweight="bold"
+)
+ax1.set_xticks(x)
+ax1.set_xticklabels(swiss_fd["Parameter (+5%)"], rotation=15)
+ax1.set_ylabel("Impact Scale (%)")
+ax1.axhline(0, color="black", linewidth=0.8)
+ax1.grid(True, linestyle="--", alpha=0.5)
+ax1.legend()
+
+# Plot 2: Global Sensitivity Morris Plot (mu* vs sigma)
+ax2.scatter(
+    df_morris["mu_star (Impact Strength)"],
+    df_morris["sigma (Non-Linearity/Interaction)"],
+    s=150,
+    color="purple",
+    edgecolors="black",
+    zorder=5,
+)
+
+for _, r in df_morris.iterrows():
+    ax2.annotate(
+        r["Parameter"],
+        (
+            r["mu_star (Impact Strength)"] + 0.5,
+            r["sigma (Non-Linearity/Interaction)"] + 0.1,
+        ),
+        fontsize=10,
+        fontweight="bold",
+    )
+
+ax2.set_title(
+    "Morris Screening Map: Direct Impact (μ*) vs Non-Linearity/Interactions (σ)",
+    fontweight="bold",
+)
+ax2.set_xlabel("Overall Effect Magnitude μ* (Higher = More Sensitive)")
+ax2.set_ylabel("Interaction & Non-Linearity σ (Higher = Higher Interaction)")
+ax2.grid(True, linestyle="--", alpha=0.5)
+
+plt.tight_layout()
+plt.show()
