@@ -1,0 +1,425 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize_scalar
+
+# ==========================================
+# 1. INPUT DATA & PLANT COEFFICIENTS
+# ==========================================
+plants = pd.DataFrame(
+    {
+        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
+        "P_elec": [36, 70, 51, 96],  # €/MWh
+        "P_CO2": [83, 83, 83, 83],  # €/t
+        "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+        "OPEX_spec": [30, 30, 30, 30],  # €/t
+    }
+)
+
+S = 0.0  # Carbon subsidy (€/t)
+eta_actual = 0.90  # Base capture efficiency
+
+# Compute plant specific baseline parameters
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+
+# ==========================================
+# 2. GRID CONFIGURATION
+# ==========================================
+eta = np.linspace(0.10, 0.95, 300)
+Pco2 = np.linspace(30, 150, 300)
+ETA, PCO2 = np.meshgrid(eta, Pco2)
+
+
+# ==========================================
+# 3. REGRESSION MODELS
+# ==========================================
+def f_full_econometric(eta_grid, plant_row, var=0.15):
+    Qmax = plant_row["Qcapt"] / eta_actual
+
+    capacity = Qmax
+    labor_hours = 12000 * Qmax
+    total_cement_prod = eta_grid * Qmax * 1.5
+    num_kilns = 2.0
+    pct_masonry = 0.15
+    pct_4_or_other = 0.20
+    pct_wet = 0.05
+
+    beta0, beta1, beta2, beta3 = 0.80, -0.04, 0.02, 0.12
+    beta4, beta5, beta6, beta7 = 0.05, -0.08, 0.03, 0.15
+
+    E_i = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(total_cement_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    ref_prod = eta_actual * Qmax * 1.5
+    E_i_ref = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(ref_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    target_E_spec = plant_row["E_spec"]
+    f_m = (
+        target_E_spec
+        * (E_i / E_i_ref)
+        * (1.0 + 0.45 * (eta_grid / eta_actual - 1.0))
+    )
+
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+def f_logarithmic(eta_grid, plant_row, var=0.15):
+    E0_val = plant_row["E0"]
+    base = 0.5 + 0.38 * np.log(eta_grid + 0.1)
+    scale = (E0_val / (1 - eta_actual)) / (
+        0.5 + 0.38 * np.log(eta_actual + 0.1)
+    )
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+def f_exponential(eta_grid, plant_row, var=0.15):
+    E0_val = plant_row["E0"]
+    base = 0.18 * np.exp(2.1 * eta_grid)
+    scale = (E0_val / (1 - eta_actual)) / (0.18 * np.exp(2.1 * eta_actual))
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+def f_power_law(eta_grid, plant_row, beta=0.65, var=0.15):
+    E0_val = plant_row["E0"]
+    f_m = E0_val / ((1 - eta_grid) ** beta)
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+scenarios = {
+    "Full Econometric": f_full_econometric,
+    "Logarithmic": f_logarithmic,
+    "Exponential": f_exponential,
+    "Power Law": f_power_law,
+}
+
+# ==========================================
+# 4. CONTOUR MAP GENERATION ENGINE
+# ==========================================
+for _, row in plants.iterrows():
+    plant_name = row["Plant"]
+    Qmax = row["Qcapt"] / eta_actual
+    P_elec_val = row["P_elec"]
+    OPEX_fixed = row["OPEX_spec"] * row["Qcapt"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+
+    for sc_idx, (sc_name, sc_func) in enumerate(scenarios.items()):
+        ax = axes[sc_idx]
+
+        E_spec_m, E_spec_low, E_spec_high = sc_func(ETA, row)
+        OPEX_spec_mesh = OPEX_fixed / (ETA * Qmax)
+
+        Phi_m = PCO2 + S - (E_spec_m * P_elec_val) - OPEX_spec_mesh
+        F_m = ETA * Qmax * Phi_m
+
+        F_upper = (
+            ETA * Qmax * (PCO2 + S - (E_spec_low * P_elec_val) - OPEX_spec_mesh)
+        )
+        F_lower = (
+            ETA * Qmax * (PCO2 + S - (E_spec_high * P_elec_val) - OPEX_spec_mesh)
+        )
+
+        cf = ax.contourf(ETA, PCO2, F_m, levels=25, cmap="plasma")
+        fig.colorbar(
+            cf, ax=ax, label="F, mln €/year", fraction=0.046, pad=0.04
+        )
+
+        ax.contourf(
+            ETA,
+            PCO2,
+            np.clip((F_upper >= 0) & (F_lower <= 0), 0, 1),
+            levels=[0.5, 1],
+            colors=["cyan"],
+            alpha=0.3,
+        )
+
+        ax.contour(
+            ETA,
+            PCO2,
+            F_lower,
+            levels=[0],
+            colors="cyan",
+            linestyles="--",
+            linewidths=1.5,
+        )
+        ax.contour(
+            ETA,
+            PCO2,
+            F_upper,
+            levels=[0],
+            colors="cyan",
+            linestyles="--",
+            linewidths=1.5,
+        )
+
+        var_patch = plt.Rectangle(
+            (0, 0),
+            1,
+            1,
+            fc="cyan",
+            alpha=0.3,
+            ec="cyan",
+            ls="--",
+            label=r"Regression Variation Zone ($\pm 15\%$)",
+        )
+
+        ax.contour(
+            ETA,
+            PCO2,
+            F_m,
+            levels=[0],
+            colors="blue",
+            linewidths=3,
+        )
+
+        idx_F = np.unravel_index(np.argmax(F_m), F_m.shape)
+        ax.plot(
+            ETA[idx_F],
+            PCO2[idx_F],
+            "ko",
+            markersize=9,
+            label="Maximum F point",
+            zorder=5,
+        )
+        ax.axvline(
+            ETA[idx_F], color="black", linestyle="--", linewidth=1.5, zorder=4
+        )
+
+        idx_Phi = np.unravel_index(np.argmax(Phi_m), Phi_m.shape)
+        ax.plot(
+            ETA[idx_Phi],
+            PCO2[idx_Phi],
+            "g^",
+            markersize=10,
+            label=r"Maximum $\Phi$ point",
+            zorder=5,
+        )
+
+        feasible_mask = F_m >= 0
+        if np.any(feasible_mask):
+            feasible_indices = np.where(feasible_mask)
+            min_pos = np.argmin(PCO2[feasible_indices])
+            i_min = feasible_indices[0][min_pos]
+            j_min = feasible_indices[1][min_pos]
+            ax.plot(
+                ETA[i_min, j_min],
+                PCO2[i_min, j_min],
+                "bo",
+                markersize=9,
+                label="Minimum functional point",
+                zorder=5,
+            )
+
+        ax.set_title(
+            f"{plant_name}: {sc_name} Scenario",
+            fontsize=12,
+            fontweight="bold",
+        )
+        ax.set_xlabel(r"Capture efficiency $\eta$")
+        ax.set_ylabel(r"$\text{CO}_2$ price, €/t")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(var_patch)
+        labels.append(r"Regression Variation Zone ($\pm 15\%$)")
+
+        by_label = dict(zip(labels, handles))
+        ax.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="lower left",
+            fontsize=8.5,
+            framealpha=0.9,
+        )
+
+    plt.suptitle(
+        f"Contour Gradient Maps with Multi-Variable Econometric Model — {plant_name}",
+        fontsize=16,
+        fontweight="bold",
+        y=0.99,
+    )
+    plt.tight_layout()
+    plt.show()
+
+
+# ==========================================
+# 5. OPTIMIZATION MODULE
+# ==========================================
+
+
+def objective_profit(eta_val, p_co2_val, plant_row, model_func):
+    """Calculates profit (F) to be maximized (returns negative for minimization)."""
+    Qmax = plant_row["Qcapt"] / eta_actual
+    OPEX_fixed = plant_row["OPEX_spec"] * plant_row["Qcapt"]
+    P_elec_val = plant_row["P_elec"]
+
+    E_spec_m, _, _ = model_func(eta_val, plant_row)
+    OPEX_spec = OPEX_fixed / (eta_val * Qmax)
+
+    Phi_m = p_co2_val + S - (E_spec_m * P_elec_val) - OPEX_spec
+    F_m = eta_val * Qmax * Phi_m
+    return -F_m
+
+
+# ---------------------------------------------------------
+# A. Fixed Carbon-Price Scenario Optimization
+# ---------------------------------------------------------
+print("\n" + "=" * 70)
+print("1. OPTIMIZATION FOR FIXED CARBON PRICE (P_CO2 = 83 €/t)")
+print("=" * 70)
+
+opt_results_fixed = []
+
+for _, row in plants.iterrows():
+    p_co2_fixed = row["P_CO2"]
+    for sc_name, sc_func in scenarios.items():
+        res = minimize_scalar(
+            objective_profit,
+            bounds=(0.10, 0.95),
+            args=(p_co2_fixed, row, sc_func),
+            method="bounded",
+        )
+
+        optimal_eta = res.x
+        max_profit = -res.fun
+
+        opt_results_fixed.append(
+            {
+                "Plant": row["Plant"],
+                "Model": sc_name,
+                "Fixed P_CO2 (€/t)": p_co2_fixed,
+                "Optimal Efficiency (eta*)": round(optimal_eta, 4),
+                "Max Profit F (Mln €/yr)": round(max_profit, 3),
+            }
+        )
+
+df_fixed_opt = pd.DataFrame(opt_results_fixed)
+print(df_fixed_opt.to_string(index=False))
+
+
+# ---------------------------------------------------------
+# B. Multi-Scenario & Probabilistic Distribution Optimization
+# ---------------------------------------------------------
+print("\n" + "=" * 70)
+print("2. PROBABILISTIC CARBON PRICE SCENARIO OPTIMIZATION (MONTE CARLO)")
+print("=" * 70)
+
+# Defined Carbon Price Scenarios (Mean, Std)
+np.random.seed(42)
+n_samples = 5000
+p_co2_distribution = np.random.normal(loc=85, scale=20, size=n_samples)
+p_co2_distribution = np.clip(
+    p_co2_distribution, 30, 150
+)  # Keep within grid boundaries
+
+probabilistic_results = []
+
+for _, row in plants.iterrows():
+    # Evaluate for Full Econometric Model as primary baseline
+    sc_func = f_full_econometric
+
+    # Find global optimal eta under expected value of P_CO2 distribution
+    mean_pco2 = np.mean(p_co2_distribution)
+    res = minimize_scalar(
+        objective_profit,
+        bounds=(0.10, 0.95),
+        args=(mean_pco2, row, sc_func),
+        method="bounded",
+    )
+    best_eta = res.x
+
+    # Simulate profit performance distribution at optimal eta
+    simulated_profits = [-objective_profit(best_eta, p, row, sc_func) for p in p_co2_distribution]
+
+    expected_profit = np.mean(simulated_profits)
+    std_profit = np.std(simulated_profits)
+    var_95 = np.percentile(simulated_profits, 5)  # 5th percentile risk metric
+
+    probabilistic_results.append(
+        {
+            "Plant": row["Plant"],
+            "Optimal Eta": round(best_eta, 4),
+            "Mean P_CO2 (€/t)": round(mean_pco2, 2),
+            "Expected Profit E[F] (Mln €)": round(expected_profit, 3),
+            "Std Dev Profit (Mln €)": round(std_profit, 3),
+            "95% VaR Profit (Mln €)": round(var_95, 3),
+        }
+    )
+
+df_prob_opt = pd.DataFrame(probabilistic_results)
+print(df_prob_opt.to_string(index=False))
+
+# ==========================================
+# 6. OPTIMIZATION SUMMARY VISUALIZATION
+# ==========================================
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
+
+# Plot 1: Optimal Efficiency per Plant under Fixed P_CO2 across Models
+pivot_eta = df_fixed_opt.pivot(
+    index="Plant", columns="Model", values="Optimal Efficiency (eta*)"
+)
+pivot_eta.plot(kind="bar", ax=ax1, colormap="viridis", edgecolor="black")
+ax1.set_title(
+    "Optimal Capture Efficiency (η*) at P_CO2 = 83 €/t",
+    fontweight="bold",
+)
+ax1.set_ylabel("Efficiency η*")
+ax1.set_ylim(0, 1.0)
+ax1.grid(True, linestyle="--", alpha=0.5)
+ax1.legend(fontsize=9)
+
+# Plot 2: Expected Profit vs 95% VaR Risk Profile
+x = np.arange(len(df_prob_opt["Plant"]))
+width = 0.35
+
+ax2.bar(
+    x - width / 2,
+    df_prob_opt["Expected Profit E[F] (Mln €)"],
+    width,
+    label="Expected Profit E[F]",
+    color="#2ca02c",
+    edgecolor="black",
+)
+ax2.bar(
+    x + width / 2,
+    df_prob_opt["95% VaR Profit (Mln €)"],
+    width,
+    label="95% Value at Risk (VaR)",
+    color="#d62728",
+    edgecolor="black",
+)
+
+ax2.set_title(
+    "Profit Distribution & Risk under Carbon Price Uncertainty ~ N(85, 20²)",
+    fontweight="bold",
+)
+ax2.set_xticks(x)
+ax2.set_xticklabels(df_prob_opt["Plant"])
+ax2.set_ylabel("Mln € / year")
+ax2.grid(True, linestyle="--", alpha=0.5)
+ax2.legend(fontsize=9)
+
+plt.tight_layout()
+plt.show()
