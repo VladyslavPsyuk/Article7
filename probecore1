@@ -1,0 +1,297 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ==========================================
+# 1. INPUT DATA & PLANT COEFFICIENTS
+# ==========================================
+plants = pd.DataFrame(
+    {
+        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
+        "P_elec": [36, 70, 51, 96],  # €/MWh
+        "P_CO2": [83, 83, 83, 83],  # €/t
+        "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+        "OPEX_spec": [30, 30, 30, 30],  # €/t
+    }
+)
+
+S = 0.0  # Carbon subsidy (€/t)
+eta_actual = 0.90  # Base capture efficiency
+
+# Compute plant specific baseline parameters
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+
+# ==========================================
+# 2. GRID CONFIGURATION
+# ==========================================
+eta = np.linspace(0.10, 0.95, 300)
+Pco2 = np.linspace(30, 150, 300)
+ETA, PCO2 = np.meshgrid(eta, Pco2)
+
+
+# ==========================================
+# 3. REGRESSION MODELS
+# ==========================================
+
+
+# 1. FULL LOG-LINEAR ECONOMETRIC MODEL (From Equation Image)
+def f_econometric_loglinear(eta_grid, plant_row, var=0.15):
+    Qmax = plant_row["Qcapt"] / eta_actual
+
+    # Input Variables (scaled/assumed for demonstration)
+    capacity = Qmax
+    labor_hours = 12000 * Qmax  # Scaled labor hours
+    total_cement_production = (
+        eta_grid * Qmax
+    )  # Actual capture/production quantity
+    num_kilns = 2  # Number of kilns
+    pct_masonry = 0.15  # % masonry
+    pct_4_or_other = 0.10  # % 4 or other
+    pct_wet = 0.05  # % wet process
+
+    # Regression coefficients (beta)
+    beta0 = 0.12
+    beta1 = -0.05  # Capacity scaling
+    beta2 = 0.03  # Labor hours scaling
+    beta3 = 0.45  # Cement production scaling
+    beta4 = 0.02  # Number of kilns scaling
+    beta5 = 0.01  # % masonry factor
+    beta6 = 0.015  # % 4 or other factor
+    beta7 = 0.04  # % wet process factor
+
+    # Full log-linear econometric model evaluation
+    E_i = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(total_cement_production)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    # Specific energy demand per ton E_spec = E_i / production
+    E_spec_m = E_i / total_cement_production
+
+    # Calibration scaling to align with empirical baseline at eta_actual
+    prod_ref = eta_actual * Qmax
+    E_i_ref = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(prod_ref)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+    scale_factor = plant_row["E_spec"] / (E_i_ref / prod_ref)
+    f_m = E_spec_m * scale_factor
+
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+# 2. LOGARITHMIC MODEL
+def f_logarithmic(eta_grid, plant_row, var=0.15):
+    E0_val = plant_row["E0"]
+    base = 0.5 + 0.38 * np.log(eta_grid + 0.1)
+    scale = (E0_val / (1 - eta_actual)) / (
+        0.5 + 0.38 * np.log(eta_actual + 0.1)
+    )
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+# 3. EXPONENTIAL MODEL
+def f_exponential(eta_grid, plant_row, var=0.15):
+    E0_val = plant_row["E0"]
+    base = 0.18 * np.exp(2.1 * eta_grid)
+    scale = (E0_val / (1 - eta_actual)) / (0.18 * np.exp(2.1 * eta_actual))
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+# 4. POWER LAW MODEL (Replaced Trapezoidal)
+def f_power_law(eta_grid, plant_row, beta=0.65, var=0.15):
+    E0_val = plant_row["E0"]
+    # Form: E_spec(eta) = E0 / (1 - eta)^beta
+    f_m = E0_val / ((1 - eta_grid) ** beta)
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+scenarios = {
+    "Log-Linear Econometric": f_econometric_loglinear,
+    "Logarithmic": f_logarithmic,
+    "Exponential": f_exponential,
+    "Power Law": f_power_law,
+}
+
+# ==========================================
+# 4. CONTOUR MAP GENERATION ENGINE
+# ==========================================
+for _, row in plants.iterrows():
+    plant_name = row["Plant"]
+    Qmax = row["Qcapt"] / eta_actual
+    P_elec_val = row["P_elec"]
+    OPEX_fixed = row["OPEX_spec"] * row["Qcapt"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+
+    for sc_idx, (sc_name, sc_func) in enumerate(scenarios.items()):
+        ax = axes[sc_idx]
+
+        # Calculate specific energy consumption
+        E_spec_m, E_spec_low, E_spec_high = sc_func(ETA, row)
+
+        # Operational parameters
+        OPEX_spec_mesh = OPEX_fixed / (ETA * Qmax)
+
+        # Profitability Function F
+        Phi_m = PCO2 + S - (E_spec_m * P_elec_val) - OPEX_spec_mesh
+        F_m = ETA * Qmax * Phi_m
+
+        # Bounds for variational shading
+        F_upper = (
+            ETA * Qmax * (PCO2 + S - (E_spec_low * P_elec_val) - OPEX_spec_mesh)
+        )
+        F_lower = (
+            ETA
+            * Qmax
+            * (PCO2 + S - (E_spec_high * P_elec_val) - OPEX_spec_mesh)
+        )
+
+        # 1. Base Gradient Contour Plot
+        cf = ax.contourf(ETA, PCO2, F_m, levels=25, cmap="plasma")
+        fig.colorbar(
+            cf, ax=ax, label="F, mln €/year", fraction=0.046, pad=0.04
+        )
+
+        # 2. Transparent Shaded Zone for Uncertainty Variation
+        ax.contourf(
+            ETA,
+            PCO2,
+            np.clip((F_upper >= 0) & (F_lower <= 0), 0, 1),
+            levels=[0.5, 1],
+            colors=["cyan"],
+            alpha=0.3,
+        )
+
+        # Dashed boundary lines
+        ax.contour(
+            ETA,
+            PCO2,
+            F_lower,
+            levels=[0],
+            colors="cyan",
+            linestyles="--",
+            linewidths=1.5,
+        )
+        ax.contour(
+            ETA,
+            PCO2,
+            F_upper,
+            levels=[0],
+            colors="cyan",
+            linestyles="--",
+            linewidths=1.5,
+        )
+
+        var_patch = plt.Rectangle(
+            (0, 0),
+            1,
+            1,
+            fc="cyan",
+            alpha=0.3,
+            ec="cyan",
+            ls="--",
+            label=r"Regression Variation Zone ($\pm 15\%$)",
+        )
+
+        # 3. Main Break-Even Line (F = 0)
+        ax.contour(
+            ETA,
+            PCO2,
+            F_m,
+            levels=[0],
+            colors="blue",
+            linewidths=3,
+        )
+
+        # 4. Optimization Points
+        # Maximum F Point
+        idx_F = np.unravel_index(np.argmax(F_m), F_m.shape)
+        ax.plot(
+            ETA[idx_F],
+            PCO2[idx_F],
+            "ko",
+            markersize=9,
+            label="Maximum F point",
+            zorder=5,
+        )
+        ax.axvline(
+            ETA[idx_F], color="black", linestyle="--", linewidth=1.5, zorder=4
+        )
+
+        # Maximum Phi Point
+        idx_Phi = np.unravel_index(np.argmax(Phi_m), Phi_m.shape)
+        ax.plot(
+            ETA[idx_Phi],
+            PCO2[idx_Phi],
+            "g^",
+            markersize=10,
+            label=r"Maximum $\Phi$ point",
+            zorder=5,
+        )
+
+        # Minimum Functional Point (lowest CO2 price where F >= 0)
+        feasible_mask = F_m >= 0
+        if np.any(feasible_mask):
+            feasible_indices = np.where(feasible_mask)
+            min_pos = np.argmin(PCO2[feasible_indices])
+            i_min = feasible_indices[0][min_pos]
+            j_min = feasible_indices[1][min_pos]
+            ax.plot(
+                ETA[i_min, j_min],
+                PCO2[i_min, j_min],
+                "bo",
+                markersize=9,
+                label="Minimum functional point",
+                zorder=5,
+            )
+
+        # Plot Styling
+        ax.set_title(
+            f"{plant_name}: {sc_name} Scenario",
+            fontsize=12,
+            fontweight="bold",
+        )
+        ax.set_xlabel(r"Capture efficiency $\eta$")
+        ax.set_ylabel(r"$\text{CO}_2$ price, €/t")
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        # Legend Setup
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(var_patch)
+        labels.append(r"Regression Variation Zone ($\pm 15\%$)")
+
+        by_label = dict(zip(labels, handles))
+        ax.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="lower left",
+            fontsize=8.5,
+            framealpha=0.9,
+        )
+
+    plt.suptitle(
+        f"Contour Gradient Maps with Log-Linear Econometric Regression — {plant_name}",
+        fontsize=16,
+        fontweight="bold",
+        y=0.99,
+    )
+    plt.tight_layout()
+    plt.show()
