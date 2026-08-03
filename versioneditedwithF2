@@ -44,6 +44,13 @@ S = 0
 eta_actual = 0.90
 
 # ==========================================
+# OPTIMIZATION SETTINGS
+# ==========================================
+P_CO2_fixed = 83.0
+P_CO2_scenarios = np.array([50, 83, 120])
+P_CO2_probs = np.array([0.2, 0.5, 0.3])
+
+# ==========================================
 # 2. GRID
 # ==========================================
 eta = np.linspace(0.10, 0.95, 300)
@@ -64,7 +71,6 @@ for _, row in plants.iterrows():
     scenario_summary = []
     sobol_results = {}
 
-    # Sensitivity problem definition
     problem = {
         'num_vars': 6,
         'names': ['P_CO2', 'eta', 'P_elec', 'E_spec', 'OPEX', 'Qmax'],
@@ -83,17 +89,14 @@ for _, row in plants.iterrows():
     # ==========================================
     for scen_name, scen_fun in scenarios.items():
 
-        # Scenario-specific E_spec
         E_spec = row["E_spec_Pelec_table"] / P_elec_val
         E_spec_mesh = E_spec * np.ones_like(ETA)
 
-        # Scenario energy term
         Energy_term = scen_fun(ETA, P_elec_val, E_spec_mesh)
 
         Phi = PCO2 - Energy_term - OPEX_fixed / (ETA * Qmax)
         F = ETA * Qmax * Phi
 
-        # Scenario-specific break-even line
         Energy_term_line = scen_fun(eta, P_elec_val, E_spec)
         Pco2_break_even_scen = Energy_term_line + OPEX_fixed / (eta * Qmax)
 
@@ -102,21 +105,18 @@ for _, row in plants.iterrows():
             (Pco2_break_even_scen <= Pco2.max())
         )
 
-        # Optimal F
         idx_F = np.unravel_index(np.argmax(F), F.shape)
         eta_F_opt = ETA[idx_F]
         Pco2_F_opt = PCO2[idx_F]
         F_opt = F[idx_F]
         Phi_F_opt = Phi[idx_F]
 
-        # Optimal Φ
         idx_Phi = np.unravel_index(np.argmax(Phi), Phi.shape)
         eta_Phi_opt = ETA[idx_Phi]
         Pco2_Phi_opt = PCO2[idx_Phi]
         Phi_opt = Phi[idx_Phi]
         F_at_Phi_opt = F[idx_Phi]
 
-        # Minimum functional point
         feasible_mask = (F >= 0)
         if np.any(feasible_mask):
             feasible_indices = np.where(feasible_mask)
@@ -133,6 +133,26 @@ for _, row in plants.iterrows():
             Phi_min_func = np.nan
             F_min_func = np.nan
 
+        # ==========================================
+        # OPTIMIZATION BLOCK
+        # ==========================================
+
+        idx_p_fixed = np.argmin(np.abs(Pco2 - P_CO2_fixed))
+        F_line_fixed = F[idx_p_fixed, :]
+        idx_eta_fixed = np.argmax(F_line_fixed)
+        eta_opt_fixed = eta[idx_eta_fixed]
+        F_opt_fixed = F_line_fixed[idx_eta_fixed]
+        Phi_opt_fixed = Phi[idx_p_fixed, idx_eta_fixed]
+
+        F_eta_exp = np.zeros_like(eta)
+        for k, P_s in enumerate(P_CO2_scenarios):
+            idx_p_s = np.argmin(np.abs(Pco2 - P_s))
+            F_eta_exp += P_CO2_probs[k] * F[idx_p_s, :]
+
+        idx_eta_exp = np.argmax(F_eta_exp)
+        eta_opt_exp = eta[idx_eta_exp]
+        F_opt_exp = F_eta_exp[idx_eta_exp]
+
         scenario_summary.append({
             "Scenario": scen_name,
             "eta_F": float(eta_F_opt),
@@ -140,10 +160,15 @@ for _, row in plants.iterrows():
             "F_max": float(F_opt),
             "eta_Phi": float(eta_Phi_opt),
             "Pco2_Phi": float(Pco2_Phi_opt),
-            "Phi_max": float(Phi_opt)
+            "Phi_max": float(Phi_opt),
+            "eta_opt_fixed": float(eta_opt_fixed),
+            "F_opt_fixed": float(F_opt_fixed),
+            "Phi_opt_fixed": float(Phi_opt_fixed),
+            "eta_opt_exp": float(eta_opt_exp),
+            "F_opt_exp": float(F_opt_exp)
         })
 
-        # ========= PHI SURFACE =========
+        # ========= PHI SURFACE (unchanged) =========
         fig = plt.figure(figsize=(10, 5))
         ax = fig.add_subplot(111, projection="3d")
         surface = ax.plot_surface(
@@ -165,7 +190,7 @@ for _, row in plants.iterrows():
         fig.colorbar(surface, shrink=0.5)
         plt.show()
 
-        # ========= F SURFACE =========
+        # ========= F SURFACE (unchanged) =========
         fig = plt.figure(figsize=(10, 5))
         ax = fig.add_subplot(111, projection="3d")
         surface = ax.plot_surface(
@@ -187,39 +212,49 @@ for _, row in plants.iterrows():
         fig.colorbar(surface, shrink=0.5)
         plt.show()
 
-        # ========= Φ CONTOUR + GRADIENT =========
-        dPhi_deta = np.gradient(Phi, eta, axis=1)
-        dPhi_dPco2 = np.gradient(Phi, Pco2, axis=0)
-        grad_mag = np.sqrt(dPhi_deta**2 + dPhi_dPco2**2)
-        dPhi_deta_norm = dPhi_deta / (grad_mag + 1e-9)
-        dPhi_dPco2_norm = dPhi_dPco2 / (grad_mag + 1e-9)
+        # ==========================================
+        # ========= F CONTOUR + GRADIENT (REPLACEMENT BLOCK) =========
+        # ==========================================
+        dF_deta = np.gradient(F, eta, axis=1)
+        dF_dPco2 = np.gradient(F, Pco2, axis=0)
+        grad_mag_F = np.sqrt(dF_deta**2 + dF_dPco2**2)
+        dF_deta_norm = dF_deta / (grad_mag_F + 1e-9)
+        dF_dPco2_norm = dF_dPco2 / (grad_mag_F + 1e-9)
 
         plt.figure(figsize=(8, 6))
-        contour = plt.contourf(ETA, PCO2, Phi, levels=40, cmap="plasma")
-        plt.colorbar(contour, label="Φ")
+        contourF = plt.contourf(ETA, PCO2, F, levels=40, cmap="viridis")
+        plt.colorbar(contourF, label="F")
+
         plt.plot(
             eta[valid_break_even_scen],
             Pco2_break_even_scen[valid_break_even_scen],
-            color="blue", linewidth=3, label="Φ = 0"
+            color="blue", linewidth=3, label="F = 0"
         )
-        plt.scatter(eta_F_opt, Pco2_F_opt, color="black", s=100, label="Max F")
-        plt.scatter(eta_Phi_opt, Pco2_Phi_opt, color="green", marker="^", s=120, label="Max Φ")
+
+        plt.scatter(eta_F_opt, Pco2_F_opt, color="black", s=120, label="Max F")
+        plt.scatter(eta_min_func, Pco2_min_func, color="cyan", s=120, marker="s", label="Min F ≥ 0")
+
+        plt.scatter(eta_opt_fixed, P_CO2_fixed,
+                    color="red", s=160, marker="X", label="Opt η (fixed CO₂)")
+
+        plt.scatter(eta_opt_exp, np.sum(P_CO2_scenarios * P_CO2_probs),
+                    color="yellow", s=160, marker="P", label="Opt η (expected CO₂)")
 
         skip = (slice(None, None, 12), slice(None, None, 12))
         plt.quiver(
             ETA[skip], PCO2[skip],
-            dPhi_deta_norm[skip], dPhi_dPco2_norm[skip],
+            dF_deta_norm[skip], dF_dPco2_norm[skip],
             color="white", alpha=0.7
         )
 
-        plt.title(f"{plant} – Scenario {scen_name}: Φ Contour + Gradient")
+        plt.title(f"{plant} – Scenario {scen_name}: F Contour + Gradient")
         plt.xlabel("η")
         plt.ylabel("CO₂ price")
         plt.legend()
         plt.grid(True)
         plt.show()
 
-        # ========= SOBOL SENSITIVITY (NOW FOR F) =========
+        # ========= SOBOL SENSITIVITY (unchanged) =========
         def model_eval(x):
             P_CO2_s, eta_s, P_elec_s, E_spec_s, OPEX_s, Qmax_s = x
             Energy_s = scen_fun(eta_s, P_elec_s, E_spec_s)
@@ -233,16 +268,16 @@ for _, row in plants.iterrows():
 
         sobol_results[scen_name] = sobol_res
 
-    # ========= MIXED SUMMARY =========
-    print(f"\n=== MIXED MAX POINT SUMMARY FOR PLANT: {plant} ===")
+    print(f"\n=== MIXED MAX POINT + OPTIMIZATION SUMMARY FOR PLANT: {plant} ===")
     for s in scenario_summary:
         print(
             f"Scenario {s['Scenario']}: "
             f"Max F → η={s['eta_F']:.3f}, P_CO2={s['Pco2_F']:.2f}, F={s['F_max']:.2f}; "
-            f"Max Φ → η={s['eta_Phi']:.3f}, P_CO2={s['Pco2_Phi']:.2f}, Φ={s['Phi_max']:.2f}"
+            f"Max Φ → η={s['eta_Phi']:.3f}, P_CO2={s['Pco2_Phi']:.2f}, Φ={s['Phi_max']:.2f}; "
+            f"Opt (fixed P_CO2={P_CO2_fixed:.2f}) → η*={s['eta_opt_fixed']:.3f}, F*={s['F_opt_fixed']:.2f}; "
+            f"Opt (price distribution) → η*={s['eta_opt_exp']:.3f}, E[F]={s['F_opt_exp']:.2f}"
         )
 
-    # ========= COMBINED SOBOL (A vs B) =========
     if "A" in sobol_results and "B" in sobol_results:
         scenA = sobol_results["A"]
         scenB = sobol_results["B"]
