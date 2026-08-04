@@ -1,0 +1,185 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ==========================================
+# 1. INPUT DATA & PLANT COEFFICIENTS
+# ==========================================
+plants = pd.DataFrame(
+    {
+        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],
+        "P_elec": [36.0, 70.0, 51.0, 96.0],
+        "P_CO2": [83.0, 83.0, 83.0, 83.0],
+        "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+        "OPEX_spec": [30.0, 30.0, 30.0, 30.0],
+        "CAPEX_total": [150.0, 120.0, 45.0, 190.0],
+    }
+)
+
+eta_actual = 0.90
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+
+r = 0.08
+n_years = 25
+CRF = (r * (1 + r) ** n_years) / ((1 + r) ** n_years - 1)
+sigma_subsidy = 0.40
+
+# ==========================================
+# 2. ENERGY SCENARIO MODELS
+# ==========================================
+def f_full_econometric(eta_grid, plant_row):
+    Qmax = plant_row["Qcapt"] / eta_actual
+    capacity = Qmax
+    labor_hours = 12000 * Qmax
+    total_cement_prod = eta_grid * Qmax * 1.5
+    num_kilns = 2.0
+    pct_masonry, pct_4_or_other, pct_wet = 0.15, 0.20, 0.05
+
+    beta0, beta1, beta2, beta3 = 0.80, -0.04, 0.02, 0.12
+    beta4, beta5, beta6, beta7 = 0.05, -0.08, 0.03, 0.15
+
+    E_i = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(total_cement_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    ref_prod = eta_actual * Qmax * 1.5
+    E_i_ref = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(ref_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    return plant_row["E_spec"] * (E_i / E_i_ref) * (1.0 + 0.45 * (eta_grid / eta_actual - 1.0))
+
+
+def f_logarithmic(eta_grid, plant_row):
+    E0_val = plant_row["E0"]
+    base = 0.5 + 0.38 * np.log(eta_grid + 0.1)
+    scale = (E0_val / (1 - eta_actual)) / (0.5 + 0.38 * np.log(eta_actual + 0.1))
+    return base * scale
+
+
+def f_exponential(eta_grid, plant_row):
+    E0_val = plant_row["E0"]
+    base = 0.18 * np.exp(2.1 * eta_grid)
+    scale = (E0_val / (1 - eta_actual)) / (0.18 * np.exp(2.1 * eta_actual))
+    return base * scale
+
+
+def f_power_law(eta_grid, plant_row, beta=0.65):
+    E0_val = plant_row["E0"]
+    return E0_val / ((1 - eta_grid) ** beta)
+
+
+energy_scenarios = {
+    "Full Econometric": f_full_econometric,
+    "Logarithmic": f_logarithmic,
+    "Exponential": f_exponential,
+    "Power Law": f_power_law,
+}
+
+investment_regimes = [
+    "Regime 1: OPEX Only",
+    "Regime 2: Subsidized (40%)",
+    "Regime 3: Standard Commercial",
+]
+
+# ==========================================
+# 3. CALCULATION FUNCTION
+# ==========================================
+def calculate_P_CO2_BE(eta_val, plant_row, energy_model_func, regime_idx):
+    Qmax = plant_row["Qcapt"] / eta_actual
+    P_elec_val = plant_row["P_elec"]
+    OPEX_fixed = plant_row["OPEX_spec"] * plant_row["Qcapt"]
+    CAPEX = plant_row["CAPEX_total"]
+
+    f_m = energy_model_func(eta_val, plant_row)
+    energy_cost_term = f_m * P_elec_val
+    opex_term = OPEX_fixed / (eta_val * Qmax)
+    P_BE = energy_cost_term + opex_term
+
+    if regime_idx == 0:
+        return P_BE
+    elif regime_idx == 1:
+        capex_term = (CAPEX * (1 - sigma_subsidy) * CRF) / (eta_val * Qmax)
+        return P_BE + capex_term
+    elif regime_idx == 2:
+        capex_term = (CAPEX * CRF) / (eta_val * Qmax)
+        return P_BE + capex_term
+
+
+# Build matrix
+target_eta = 0.90
+plant_names = list(plants["Plant"])
+sc_names = list(energy_scenarios.keys())
+matrix_3d = np.zeros((len(plant_names), len(sc_names), len(investment_regimes)))
+
+for p_idx, (_, row) in enumerate(plants.iterrows()):
+    for s_idx, (sc_label, sc_func) in enumerate(energy_scenarios.items()):
+        for r_idx in range(len(investment_regimes)):
+            matrix_3d[p_idx, s_idx, r_idx] = calculate_P_CO2_BE(
+                target_eta, row, sc_func, r_idx
+            )
+
+# ==========================================
+# 4. VISUALIZATION 1: 2D GROUPED BAR PLOTS
+# ==========================================
+fig, axes = plt.subplots(2, 2, figsize=(15, 10), sharey=True)
+axes = axes.flatten()
+
+bar_width = 0.25
+x_indices = np.arange(len(plant_names))
+colors = ["#2b5c8f", "#d95f02", "#2ca02c"]
+
+for s_idx, (sc_name, sc_func) in enumerate(energy_scenarios.items()):
+    ax = axes[s_idx]
+    
+    for r_idx in range(len(investment_regimes)):
+        values = matrix_3d[:, s_idx, r_idx]
+        offset = (r_idx - 1) * bar_width
+        bars = ax.bar(
+            x_indices + offset, 
+            values, 
+            width=bar_width, 
+            label=investment_regimes[r_idx] if s_idx == 0 else "",
+            color=colors[r_idx], 
+            edgecolor="black",
+            alpha=0.85
+        )
+        # Value annotations on top of bars
+        for bar in bars:
+            yval = bar.get_height()
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0, 
+                yval + 1.5, 
+                f"{yval:.1f}", 
+                ha="center", 
+                va="bottom", 
+                fontsize=8, 
+                rotation=40
+            )
+
+    ax.set_title(f"Scenario: {sc_name}", fontweight="bold", fontsize=11)
+    ax.set_xticks(x_indices)
+    ax.set_xticklabels(plant_names, fontweight="bold")
+    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    ax.set_ylabel(rf"Break-Even $P_{{\mathrm{{CO}}_2,\mathrm{{BE}}}}$ (€/t)", fontweight="bold")
+
+fig.legend(loc="upper center", bbox_to_anchor=(0.5, 1.02), ncol=3, fontsize=11, frameon=True)
+plt.suptitle(rf"2D Breakdown of Break-Even $\mathrm{{CO}}_2$ Prices ($\eta={target_eta}$)", fontsize=14, fontweight="bold", y=1.05)
+plt.tight_layout()
+plt.show()
