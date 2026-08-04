@@ -1,0 +1,331 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize_scalar
+
+# Set random seed for reproducible sampling
+np.random.seed(42)
+
+# ==========================================
+# 1. INPUT DATA & PLANT COEFFICIENTS
+# ==========================================
+plants = pd.DataFrame(
+    {
+        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
+        "P_elec": [36.0, 70.0, 51.0, 96.0],  # €/MWh
+        "P_CO2": [83.0, 83.0, 83.0, 83.0],  # €/t
+        "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+        "OPEX_spec": [30.0, 30.0, 30.0, 30.0],  # €/t
+    }
+)
+
+S = 0.0  # Carbon subsidy (€/t)
+eta_actual = 0.90  # Base capture efficiency
+
+# Compute plant specific baseline parameters
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+
+
+# ==========================================
+# 2. CORE FINANCIAL & REGRESSION ENGINE
+# ==========================================
+def calculate_plant_financials(
+    eta_val, p_co2_val, p_elec_val, opex_spec_val, plant_row, subsidy=0.0
+):
+    """Calculates absolute financials (Revenue, Costs, Profit) in EUR/year."""
+    Qmax = plant_row["Qcapt"] / eta_actual
+
+    capacity = Qmax
+    labor_hours = 12000 * Qmax
+    total_cement_prod = eta_val * Qmax * 1.5
+    num_kilns = 2.0
+    pct_masonry, pct_4_or_other, pct_wet = 0.15, 0.20, 0.05
+
+    beta0, beta1, beta2, beta3 = 0.80, -0.04, 0.02, 0.12
+    beta4, beta5, beta6, beta7 = 0.05, -0.08, 0.03, 0.15
+
+    # Econometric Energy Multiplier System
+    E_i = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(total_cement_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    ref_prod = eta_actual * Qmax * 1.5
+    E_i_ref = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(ref_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    target_E_spec = plant_row["E_spec"]
+    E_spec_m = (
+        target_E_spec
+        * (E_i / E_i_ref)
+        * (1.0 + 0.45 * (eta_val / eta_actual - 1.0))
+    )
+
+    # Volume captured (tons/year)
+    Q_captured_tons = eta_val * Qmax * 1e6
+
+    # Financial Components (€/year)
+    Revenue = Q_captured_tons * (p_co2_val + subsidy)
+    Electricity_Cost = Q_captured_tons * E_spec_m * p_elec_val
+    Fixed_Opex = opex_spec_val * plant_row["Qcapt"] * 1e6
+    Total_Cost = Electricity_Cost + Fixed_Opex
+    Profit = Revenue - Total_Cost
+
+    return {
+        "Revenue": Revenue,
+        "Total_Cost": Total_Cost,
+        "Elec_Cost": Electricity_Cost,
+        "Fixed_Opex": Fixed_Opex,
+        "Profit": Profit,
+        "E_spec": E_spec_m,
+    }
+
+
+# ==========================================
+# 3. FINITE-DIFFERENCE & RELATIVE ANALYSIS
+# ==========================================
+print("\n" + "=" * 90)
+print("1. FINITE-DIFFERENCE SENSITIVITIES & RELATIVE IMPACT (% OF REVENUE & COST)")
+print("=" * 90)
+
+delta = 0.05  # +5% perturbation step size
+fd_results = []
+
+for _, row in plants.iterrows():
+    p_name = row["Plant"]
+    b_eta, b_pco2, b_pelec, b_opex = 0.90, row["P_CO2"], row["P_elec"], row["OPEX_spec"]
+
+    base_fin = calculate_plant_financials(b_eta, b_pco2, b_pelec, b_opex, row)
+    Rev_base, Cost_base, F_base = base_fin["Revenue"], base_fin["Total_Cost"], base_fin["Profit"]
+
+    params_to_test = {
+        "P_CO2 (+5%)": (b_eta, b_pco2 * (1 + delta), b_pelec, b_opex),
+        "P_elec (+5%)": (b_eta, b_pco2, b_pelec * (1 + delta), b_opex),
+        "OPEX_spec (+5%)": (b_eta, b_pco2, b_pelec, b_opex * (1 + delta)),
+        "eta (+5%)": (b_eta * (1 + delta), b_pco2, b_pelec, b_opex),
+    }
+
+    for p_label, (e, p_c, p_e, o) in params_to_test.items():
+        fin_pert = calculate_plant_financials(e, p_c, p_e, o, row)
+        abs_diff_eur = fin_pert["Profit"] - F_base
+
+        fd_results.append(
+            {
+                "Plant": p_name,
+                "Parameter Perturbation": p_label,
+                "Absolute Shift (€/year)": round(abs_diff_eur, 2),
+                "% of Total Revenue": round((abs_diff_eur / Rev_base) * 100, 2),
+                "% of Total Cost": round((abs_diff_eur / Cost_base) * 100, 2),
+            }
+        )
+
+df_fd = pd.DataFrame(fd_results)
+print(df_fd.to_string(index=False))
+
+
+# ==========================================
+# 4. STANDARDIZED SCENARIO EVALUATION
+# ==========================================
+print("\n" + "=" * 90)
+print("2. STANDARDIZED SCENARIO RANGES (PROFIT IN MLN €/YEAR)")
+print("=" * 90)
+
+scenarios_def = {
+    "Base Case": {"P_CO2": 83.0, "P_elec_mult": 1.0, "OPEX_mult": 1.0},
+    "High Carbon / Low Power": {"P_CO2": 120.0, "P_elec_mult": 0.8, "OPEX_mult": 1.0},
+    "Low Carbon / High Power": {"P_CO2": 45.0, "P_elec_mult": 1.3, "OPEX_mult": 1.1},
+    "Sorbent Cost Spike": {"P_CO2": 83.0, "P_elec_mult": 1.0, "OPEX_mult": 1.4},
+}
+
+scenario_results = []
+for _, row in plants.iterrows():
+    for sc_name, sc_params in scenarios_def.items():
+        p_c = sc_params["P_CO2"]
+        p_e = row["P_elec"] * sc_params["P_elec_mult"]
+        o_s = row["OPEX_spec"] * sc_params["OPEX_mult"]
+
+        fin = calculate_plant_financials(0.90, p_c, p_e, o_s, row)
+
+        scenario_results.append(
+            {
+                "Plant": row["Plant"],
+                "Scenario": sc_name,
+                "Profit (Mln €/yr)": round(fin["Profit"] / 1e6, 3),
+            }
+        )
+
+df_scenarios = pd.DataFrame(scenario_results)
+df_scenario_pivot = df_scenarios.pivot(
+    index="Plant", columns="Scenario", values="Profit (Mln €/yr)"
+)
+print(df_scenario_pivot.to_string())
+
+
+# ==========================================
+# 5. GLOBAL SENSITIVITY ANALYSIS (SOBOL METHOD)
+# ==========================================
+print("\n" + "=" * 90)
+print("3. GLOBAL SENSITIVITY ANALYSIS (SOBOL VARIANCE DECOMPOSITION)")
+print("=" * 90)
+
+def generate_saltelli_samples(bounds, N):
+    """Generates Saltelli sample matrices A, B, and C_i for Sobol indices."""
+    num_vars = len(bounds)
+    A = np.random.uniform(0, 1, (N, num_vars))
+    B = np.random.uniform(0, 1, (N, num_vars))
+
+    # Scale to physical bounds
+    for i, (low, high) in enumerate(bounds):
+        A[:, i] = A[:, i] * (high - low) + low
+        B[:, i] = B[:, i] * (high - low) + low
+
+    # Construct C_i matrices
+    AB_list = []
+    for i in range(num_vars):
+        C_i = np.copy(A)
+        C_i[:, i] = B[:, i]
+        AB_list.append(C_i)
+
+    return A, B, AB_list
+
+param_bounds = [
+    [0.50, 0.95],   # eta
+    [40.0, 140.0],  # P_CO2
+    [30.0, 120.0],  # P_elec
+    [15.0, 45.0],   # OPEX_spec
+]
+param_names = ["eta", "P_CO2", "P_elec", "OPEX_spec"]
+
+N_samples = 2048
+A, B, C_matrices = generate_saltelli_samples(param_bounds, N_samples)
+
+sobol_all_plants = []
+
+for _, row in plants.iterrows():
+    # Evaluate model outputs across sample matrices
+    y_A = np.array([calculate_plant_financials(x[0], x[1], x[2], x[3], row)["Profit"] / 1e6 for x in A])
+    y_B = np.array([calculate_plant_financials(x[0], x[1], x[2], x[3], row)["Profit"] / 1e6 for x in B])
+
+    var_total = np.var(np.concatenate([y_A, y_B]), ddof=1)
+
+    for i, p_name in enumerate(param_names):
+        y_Ci = np.array([calculate_plant_financials(x[0], x[1], x[2], x[3], row)["Profit"] / 1e6 for x in C_matrices[i]])
+
+        # First-Order Index (S1): Jansen estimator
+        S1 = 1 - (np.mean((y_B - y_Ci) ** 2) / (2 * var_total))
+
+        # Total-Order Index (ST): Homma & Saltelli estimator
+        ST = np.mean((y_A - y_Ci) ** 2) / (2 * var_total)
+
+        sobol_all_plants.append(
+            {
+                "Plant": row["Plant"],
+                "Parameter": p_name,
+                "S1 (First-Order)": max(0.0, round(S1, 4)),
+                "ST (Total-Order)": max(0.0, round(ST, 4)),
+                "Interaction Gap (ST - S1)": max(0.0, round(ST - S1, 4)),
+            }
+        )
+
+df_sobol = pd.DataFrame(sobol_all_plants)
+print(df_sobol.to_string(index=False))
+
+
+# ==========================================
+# 6. VISUALIZATIONS ACROSS ALL PLANTS
+# ==========================================
+plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
+
+# FIGURE 1: SOBOL VARIANCE DECOMPOSITION (S1 vs ST) FOR ALL PLANTS
+fig1, axes1 = plt.subplots(2, 2, figsize=(15, 10))
+axes1 = axes1.flatten()
+
+for idx, plant_name in enumerate(plants["Plant"]):
+    ax = axes1[idx]
+    df_p = df_sobol[df_sobol["Plant"] == plant_name]
+
+    x = np.arange(len(param_names))
+    width = 0.35
+
+    ax.bar(x - width / 2, df_p["S1 (First-Order)"], width, label="First-Order ($S_1$)", color="#1f77b4", edgecolor="black")
+    ax.bar(x + width / 2, df_p["ST (Total-Order)"], width, label="Total-Order ($S_T$)", color="#ff7f0e", edgecolor="black")
+
+    ax.set_title(f"Sobol Sensitivity: {plant_name} Plant", fontsize=12, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(param_names)
+    ax.set_ylabel("Variance Fraction")
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="upper right")
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+plt.suptitle("Global Sensitivity Analysis: Sobol Variance Decomposition by Plant", fontsize=15, fontweight="bold", y=0.98)
+plt.tight_layout()
+plt.show()
+
+
+# FIGURE 2: SCENARIO PROFITABILITY HEATMAP ACROSS ALL PLANTS
+fig2, ax2 = plt.subplots(figsize=(10, 6))
+heatmap_data = df_scenario_pivot.values
+
+im = ax2.imshow(heatmap_data, cmap="RdYlGn", aspect="auto")
+
+ax2.set_xticks(np.arange(len(df_scenario_pivot.columns)))
+ax2.set_yticks(np.arange(len(df_scenario_pivot.index)))
+ax2.set_xticklabels(df_scenario_pivot.columns, fontweight="bold")
+ax2.set_yticklabels(df_scenario_pivot.index, fontweight="bold")
+
+# Annotate values inside the heatmap
+for i in range(len(df_scenario_pivot.index)):
+    for j in range(len(df_scenario_pivot.columns)):
+        val = heatmap_data[i, j]
+        text_color = "white" if abs(val) > 40 or val < -10 else "black"
+        ax2.text(j, i, f"{val:.2f} M€", ha="center", va="center", color=text_color, fontweight="bold")
+
+cbar = fig2.colorbar(im, ax=ax2)
+cbar.set_label("Annual Profit (Mln € / year)", fontweight="bold")
+ax2.set_title("Standardized Market Scenario Profitability Across All Plants", fontsize=14, fontweight="bold", pad=15)
+plt.tight_layout()
+plt.show()
+
+
+# FIGURE 3: FINITE-DIFFERENCE RELATIVE IMPACT (% OF COST AND REVENUE)
+fig3, axes3 = plt.subplots(2, 2, figsize=(16, 10))
+axes3 = axes3.flatten()
+
+for idx, plant_name in enumerate(plants["Plant"]):
+    ax = axes3[idx]
+    df_p_fd = df_fd[df_fd["Plant"] == plant_name]
+
+    x = np.arange(len(df_p_fd["Parameter Perturbation"]))
+    width = 0.35
+
+    ax.bar(x - width / 2, df_p_fd["% of Total Revenue"], width, label="% of Revenue", color="#2ca02c", edgecolor="black")
+    ax.bar(x + width / 2, df_p_fd["% of Total Cost"], width, label="% of Total Cost", color="#d62728", edgecolor="black")
+
+    ax.set_title(f"Finite-Difference Shifts (+5%): {plant_name}", fontsize=12, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(df_p_fd["Parameter Perturbation"], rotation=15, fontsize=9)
+    ax.set_ylabel("Impact Scale (%)")
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.legend(loc="best")
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+plt.suptitle("Relative Finite-Difference Impact (+5% Shift) as % of Revenue and Cost", fontsize=15, fontweight="bold", y=0.98)
+plt.tight_layout()
+plt.show()
