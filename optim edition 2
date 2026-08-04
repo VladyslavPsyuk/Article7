@@ -7,7 +7,7 @@ import pandas as pd
 # ==========================================
 plants = pd.DataFrame(
     {
-        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
+        "Plant": ["Slite", "Aalborg Portland", "Brevik", "Górażdże"],
         "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
         "P_elec": [36, 70, 51, 96],  # €/MWh
         "P_CO2": [83, 83, 83, 83],  # €/t
