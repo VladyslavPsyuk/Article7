@@ -7,29 +7,34 @@ import pandas as pd
 # ==========================================
 plants = pd.DataFrame(
     {
-        "Plant": ["Swiss", "Dania", "Norway", "Poland"],
-        "Qcapt": [1.80, 1.42, 0.40, 2.457],
-        "P_elec": [36.0, 70.0, 51.0, 96.0],
-        "P_CO2": [83.0, 83.0, 83.0, 83.0],
+        "Plant": ["Slite", "Aalborg Portland", "Brevik", "Górażdże"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
+        "P_elec": [36, 70, 51, 96],  # €/MWh
+        "P_CO2": [83, 83, 83, 83],  # €/t
         "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
-        "OPEX_spec": [30.0, 30.0, 30.0, 30.0],
-        "CAPEX_total": [150.0, 120.0, 45.0, 190.0],
+        "OPEX_spec": [30, 30, 30, 30],  # €/t
+        "CAPEX_total": [165.0, 142.0, 58.0, 205.0],  # mln €
+        "CRF": [0.08, 0.08, 0.08, 0.08],
+        "sigma": [0.40, 0.40, 0.40, 0.40],
     }
 )
 
-eta_actual = 0.90
+S = 0.0  # Carbon subsidy (€/t)
+eta_actual = 0.90  # Base capture efficiency
+
 plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
 plants["E0"] = plants["E_spec"] * (1 - eta_actual)
 
-r = 0.08
-n_years = 25
-CRF = (r * (1 + r) ** n_years) / ((1 + r) ** n_years - 1)
-sigma_subsidy = 0.40
+# Grid configuration for functional point search
+eta = np.linspace(0.10, 0.95, 300)
+Pco2 = np.linspace(30, 150, 300)
+ETA, PCO2 = np.meshgrid(eta, Pco2)
+
 
 # ==========================================
-# 2. ENERGY SCENARIO MODELS
+# 2. REGRESSION MODELS
 # ==========================================
-def f_full_econometric(eta_grid, plant_row):
+def f_full_econometric(eta_grid, plant_row, var=0.15):
     Qmax = plant_row["Qcapt"] / eta_actual
     capacity = Qmax
     labor_hours = 12000 * Qmax
@@ -63,123 +68,178 @@ def f_full_econometric(eta_grid, plant_row):
         + beta7 * pct_wet
     )
 
-    return plant_row["E_spec"] * (E_i / E_i_ref) * (1.0 + 0.45 * (eta_grid / eta_actual - 1.0))
+    f_m = (
+        plant_row["E_spec"]
+        * (E_i / E_i_ref)
+        * (1.0 + 0.45 * (eta_grid / eta_actual - 1.0))
+    )
+    return f_m, f_m * (1 - var), f_m * (1 + var)
 
 
-def f_logarithmic(eta_grid, plant_row):
+def f_logarithmic(eta_grid, plant_row, var=0.15):
     E0_val = plant_row["E0"]
     base = 0.5 + 0.38 * np.log(eta_grid + 0.1)
-    scale = (E0_val / (1 - eta_actual)) / (0.5 + 0.38 * np.log(eta_actual + 0.1))
-    return base * scale
+    scale = (E0_val / (1 - eta_actual)) / (
+        0.5 + 0.38 * np.log(eta_actual + 0.1)
+    )
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
 
 
-def f_exponential(eta_grid, plant_row):
+def f_exponential(eta_grid, plant_row, var=0.15):
     E0_val = plant_row["E0"]
     base = 0.18 * np.exp(2.1 * eta_grid)
     scale = (E0_val / (1 - eta_actual)) / (0.18 * np.exp(2.1 * eta_actual))
-    return base * scale
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
 
 
-def f_power_law(eta_grid, plant_row, beta=0.65):
+def f_power_law(eta_grid, plant_row, beta=0.65, var=0.15):
     E0_val = plant_row["E0"]
-    return E0_val / ((1 - eta_grid) ** beta)
+    f_m = E0_val / ((1 - eta_grid) ** beta)
+    return f_m, f_m * (1 - var), f_m * (1 + var)
 
 
-energy_scenarios = {
+scenarios = {
     "Full Econometric": f_full_econometric,
     "Logarithmic": f_logarithmic,
     "Exponential": f_exponential,
     "Power Law": f_power_law,
 }
 
-investment_regimes = [
-    "Regime 1: OPEX Only",
-    "Regime 2: Subsidized (40%)",
-    "Regime 3: Standard Commercial",
-]
 
 # ==========================================
-# 3. CALCULATION FUNCTION
+# 3. BREAK-EVEN ENGINE WITH MIN FUNCTIONAL BASELINE
 # ==========================================
-def calculate_P_CO2_BE(eta_val, plant_row, energy_model_func, regime_idx):
+def calculate_min_functional_point(plant_row, sc_func):
+    """Finds the minimum P_CO2 break-even point on the grid where F >= 0."""
     Qmax = plant_row["Qcapt"] / eta_actual
     P_elec_val = plant_row["P_elec"]
     OPEX_fixed = plant_row["OPEX_spec"] * plant_row["Qcapt"]
+
+    E_spec_m, _, _ = sc_func(ETA, plant_row)
+    OPEX_spec_mesh = OPEX_fixed / (ETA * Qmax)
+
+    Phi_m = PCO2 + S - (E_spec_m * P_elec_val) - OPEX_spec_mesh
+    F_m = ETA * Qmax * Phi_m
+
+    feasible_mask = F_m >= 0
+    if np.any(feasible_mask):
+        feasible_indices = np.where(feasible_mask)
+        min_pos = np.argmin(PCO2[feasible_indices])
+        i_min = feasible_indices[0][min_pos]
+        j_min = feasible_indices[1][min_pos]
+        return PCO2[i_min, j_min]
+    else:
+        return 50.0  # Default fallback if unconstrained
+
+
+def calculate_breakeven_regimes(plant_row, sc_func):
+    """Computes investment regime break-evens based on Minimum Line scaling."""
+    p_min_operational = calculate_min_functional_point(plant_row, sc_func)
+
+    Qmax = plant_row["Qcapt"] / eta_actual
     CAPEX = plant_row["CAPEX_total"]
+    CRF = plant_row["CRF"]
+    sigma = plant_row["sigma"]
 
-    f_m = energy_model_func(eta_val, plant_row)
-    energy_cost_term = f_m * P_elec_val
-    opex_term = OPEX_fixed / (eta_val * Qmax)
-    P_BE = energy_cost_term + opex_term
+    # Investment additions
+    capex_comm = (CAPEX * CRF) / (eta_actual * Qmax)
+    capex_sub = (CAPEX * (1 - sigma) * CRF) / (eta_actual * Qmax)
 
-    if regime_idx == 0:
-        return P_BE
-    elif regime_idx == 1:
-        capex_term = (CAPEX * (1 - sigma_subsidy) * CRF) / (eta_val * Qmax)
-        return P_BE + capex_term
-    elif regime_idx == 2:
-        capex_term = (CAPEX * CRF) / (eta_val * Qmax)
-        return P_BE + capex_term
+    # Base minimum functional values per regime
+    min_op = p_min_operational
+    min_comm = p_min_operational + capex_comm
+    min_sub = p_min_operational + capex_sub
 
+    # Rule: Mid = Min + 15%, Max = Min + 25%
+    regimes = {
+        "Operational": (min_op * 1.15, min_op, min_op * 1.25),
+        "Commercial": (min_comm * 1.15, min_comm, min_comm * 1.25),
+        "Subsidized": (min_sub * 1.15, min_sub, min_sub * 1.25),
+    }
+    return regimes
 
-# Build matrix
-target_eta = 0.90
-plant_names = list(plants["Plant"])
-sc_names = list(energy_scenarios.keys())
-matrix_3d = np.zeros((len(plant_names), len(sc_names), len(investment_regimes)))
-
-for p_idx, (_, row) in enumerate(plants.iterrows()):
-    for s_idx, (sc_label, sc_func) in enumerate(energy_scenarios.items()):
-        for r_idx in range(len(investment_regimes)):
-            matrix_3d[p_idx, s_idx, r_idx] = calculate_P_CO2_BE(
-                target_eta, row, sc_func, r_idx
-            )
 
 # ==========================================
-# 4. VISUALIZATION 1: 2D GROUPED BAR PLOTS
+# 4. PLOTTING CANDLESTICK SUMMARY
 # ==========================================
-fig, axes = plt.subplots(2, 2, figsize=(15, 10), sharey=True)
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 axes = axes.flatten()
 
-bar_width = 0.25
-x_indices = np.arange(len(plant_names))
-colors = ["#2b5c8f", "#d95f02", "#2ca02c"]
+inv_models = ["Operational", "Commercial", "Subsidized"]
+plant_names = plants["Plant"].tolist()
 
-for s_idx, (sc_name, sc_func) in enumerate(energy_scenarios.items()):
-    ax = axes[s_idx]
-    
-    for r_idx in range(len(investment_regimes)):
-        values = matrix_3d[:, s_idx, r_idx]
-        offset = (r_idx - 1) * bar_width
+n_plants = len(plant_names)
+x = np.arange(n_plants)
+width = 0.25
+colors = ["#4c72b0", "#dd8452", "#55a868"]
+
+for sc_idx, (sc_name, sc_func) in enumerate(scenarios.items()):
+    ax = axes[sc_idx]
+
+    for m_idx, model in enumerate(inv_models):
+        mids, err_low, err_high = [], [], []
+
+        for _, row in plants.iterrows():
+            reg_dict = calculate_breakeven_regimes(row, sc_func)
+            mid, p_min, p_max = reg_dict[model]
+
+            mids.append(mid)
+            err_low.append(mid - p_min)  # Lower candle arm (15% gap)
+            err_high.append(p_max - mid)  # Upper candle arm (10% gap)
+
+        pos = x + (m_idx - 1) * width
+
+        # Bar heights: Middle scenario (Minimum + 15%)
         bars = ax.bar(
-            x_indices + offset, 
-            values, 
-            width=bar_width, 
-            label=investment_regimes[r_idx] if s_idx == 0 else "",
-            color=colors[r_idx], 
+            pos,
+            mids,
+            width,
+            label=model,
+            color=colors[m_idx],
             edgecolor="black",
-            alpha=0.85
+            alpha=0.9,
         )
-        # Value annotations on top of bars
-        for bar in bars:
-            yval = bar.get_height()
+
+        # Error bars: Min line (bottom) to Max line (+25%, top)
+        ax.errorbar(
+            pos,
+            mids,
+            yerr=[err_low, err_high],
+            fmt="none",
+            ecolor="black",
+            capsize=4,
+            capthick=1.2,
+            elinewidth=1.2,
+            zorder=5,
+        )
+
+        # Values plotted above bars
+        for bar, mid_val in zip(bars, mids):
             ax.text(
-                bar.get_x() + bar.get_width() / 2.0, 
-                yval + 1.5, 
-                f"{yval:.1f}", 
-                ha="center", 
-                va="bottom", 
-                fontsize=8, 
-                rotation=40
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height() + 2.0,
+                f"{mid_val:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=45,
             )
 
-    ax.set_title(f"Scenario: {sc_name}", fontweight="bold", fontsize=11)
-    ax.set_xticks(x_indices)
+    ax.set_title(f"Scenario: {sc_name}", fontsize=12, fontweight="bold")
+    ax.set_ylabel(r"Break-Even $P_{\text{CO2, BE}}$ (€/t)", fontsize=10)
+    ax.set_xticks(x)
     ax.set_xticklabels(plant_names, fontweight="bold")
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
-    ax.set_ylabel(rf"Break-Even $P_{{\mathrm{{CO}}_2,\mathrm{{BE}}}}$ (€/t)", fontweight="bold")
+    ax.grid(True, linestyle=":", alpha=0.6, axis="y")
+    ax.legend(loc="upper left", fontsize=8.5, framealpha=0.9)
+    ax.set_ylim(0, 180)
 
-fig.legend(loc="upper center", bbox_to_anchor=(0.5, 1.02), ncol=3, fontsize=11, frameon=True)
-plt.suptitle(rf"2D Breakdown of Break-Even $\mathrm{{CO}}_2$ Prices ($\eta={target_eta}$)", fontsize=14, fontweight="bold", y=1.05)
+plt.suptitle(
+    r"Break-Even $P_{\text{CO2,BE}}$ with Minimum Line Baseline (Bars = +15%, Candle Max = +25%)",
+    fontsize=15,
+    fontweight="bold",
+    y=0.99,
+)
 plt.tight_layout()
 plt.show()
