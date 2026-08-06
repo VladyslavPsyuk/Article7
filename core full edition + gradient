@@ -102,14 +102,14 @@ def f_power_law(eta_grid, plant_row, beta=0.65, var=0.15):
 
 
 scenarios = {
-    "Full Econometric": f_full_econometric,
-    "Logarithmic": f_logarithmic,
-    "Exponential": f_exponential,
-    "Power Law": f_power_law,
+    "Full Econometric Scenario": f_full_econometric,
+    "Logarithmic Scenario": f_logarithmic,
+    "Exponential Scenario": f_exponential,
+    "Power Law Scenario": f_power_law,
 }
 
 # ==========================================
-# 4. HELPER OPTIMIZATION FUNCTIONS
+# 4. OPTIMIZATION HELPERS
 # ==========================================
 
 
@@ -134,7 +134,7 @@ def find_breakeven_eta(plant_row, model_func, target_pco2=83.0):
 
 
 # ==========================================
-# 5. CONTOUR & GRADIENT VECTOR MAP ENGINE
+# 5. CONTOUR & GRADIENT MAP ENGINE
 # ==========================================
 for _, row in plants.iterrows():
     plant_name = row["Plant"]
@@ -149,7 +149,7 @@ for _, row in plants.iterrows():
     for sc_idx, (sc_name, sc_func) in enumerate(scenarios.items()):
         ax = axes[sc_idx]
 
-        # Calculate profit grid and margins
+        # Profit & Margin Matrix
         E_spec_m, E_spec_low, E_spec_high = sc_func(ETA, row)
         OPEX_spec_mesh = OPEX_fixed / (ETA * Qmax)
 
@@ -157,7 +157,7 @@ for _, row in plants.iterrows():
         F_m = ETA * Qmax * Phi_m
 
         # ------------------------------------------
-        # 1. CONTOUR MAP
+        # 1. BASE CONTOUR MAP
         # ------------------------------------------
         cf = ax.contourf(ETA, PCO2, F_m, levels=200, cmap="plasma")
         fig.colorbar(
@@ -169,7 +169,7 @@ for _, row in plants.iterrows():
         )
 
         # ------------------------------------------
-        # 2. GRADIENT VECTOR FIELD (∇F)
+        # 2. 2D GRADIENT VECTOR FIELD (∇F)
         # ------------------------------------------
         dF_deta, dF_dPco2 = np.gradient(F_m, eta, Pco2, axis=(1, 0))
 
@@ -189,7 +189,7 @@ for _, row in plants.iterrows():
             v_sub / magnitude_safe,
             magnitude,
             cmap="cool",
-            alpha=0.50,
+            alpha=0.45,
             scale=30,
             width=0.003,
             pivot="mid",
@@ -206,6 +206,7 @@ for _, row in plants.iterrows():
         pco2_zero_low = (E_low_eta * P_elec_val) + OPEX_spec_eta - S
         pco2_zero_high = (E_high_eta * P_elec_val) + OPEX_spec_eta - S
 
+        # Grey variation band (±15%) with cyan dashed boundaries
         ax.fill_between(
             eta,
             pco2_zero_low,
@@ -222,21 +223,67 @@ for _, row in plants.iterrows():
         )
         ax.plot(eta, pco2_zero_mid, color="blue", linewidth=2.5)
 
-        # ------------------------------------------
-        # 4. FIXED CARBON PRICE BASELINE
-        # ------------------------------------------
+        # Fixed P_CO2 = 83 baseline
         ax.axhline(
             pco2_fixed,
             color="black",
             linestyle="--",
-            linewidth=1.2,
+            linewidth=1.0,
+            alpha=0.7,
             label=f"Fixed $P_{{CO2}} = {int(pco2_fixed)}$ €/t",
         )
 
         # ------------------------------------------
-        # 5. SPECIAL POINTS COMPUTATION & PLOTTING
+        # 4. CRITICAL & OPTIMAL POINTS
         # ------------------------------------------
-        # A. Optimizer Point (At P_CO2 = 83)
+        # A. Maximum F point (Black Dot + Vertical Black Line across whole plot)
+        max_f_idx = np.unravel_index(np.argmax(F_m, axis=None), F_m.shape)
+        eta_max_F = ETA[max_f_idx]
+        pco2_max_F = PCO2[max_f_idx]
+
+        ax.plot(
+            eta_max_F,
+            pco2_max_F,
+            "ko",
+            markersize=9,
+            label="Maximum F point",
+            zorder=6,
+        )
+        ax.axvline(
+            eta_max_F, color="black", linestyle="--", linewidth=1.5, zorder=5
+        )
+
+        # B. Maximum Phi point (Green Triangle at top)
+        max_phi_idx = np.unravel_index(
+            np.argmax(Phi_m, axis=None), Phi_m.shape
+        )
+        eta_max_Phi = ETA[max_phi_idx]
+        pco2_max_Phi = PCO2[max_phi_idx]
+
+        ax.plot(
+            eta_max_Phi,
+            pco2_max_Phi,
+            "g^",
+            markersize=10,
+            label=r"Maximum $\Phi$ point",
+            zorder=6,
+        )
+
+        # C. Minimum Functional point (Blue Dot at curve minimum)
+        min_func_idx = np.argmin(pco2_zero_mid)
+        eta_min_func = eta[min_func_idx]
+        pco2_min_func = pco2_zero_mid[min_func_idx]
+
+        ax.plot(
+            eta_min_func,
+            pco2_min_func,
+            "bo",
+            markersize=9,
+            label="Minimum functional point",
+            zorder=6,
+        )
+
+        # D. Optimizer Point (Red Star at P_CO2 = 83)
         res = minimize_scalar(
             objective_profit,
             bounds=(0.10, 0.95),
@@ -269,7 +316,7 @@ for _, row in plants.iterrows():
             ),
         )
 
-        # B. Break-Even Point (At P_CO2 = 83)
+        # E. Break-Even Point (Green Dot at P_CO2 = 83)
         be_eta = find_breakeven_eta(row, sc_func, pco2_fixed)
         if be_eta is not None:
             ax.plot(
@@ -295,34 +342,6 @@ for _, row in plants.iterrows():
                 ),
             )
 
-        # C. Minimum Functional Point (Global min on zero-profit curve)
-        min_func_idx = np.argmin(pco2_zero_mid)
-        eta_min_func = eta[min_func_idx]
-        pco2_min_func = pco2_zero_mid[min_func_idx]
-        ax.plot(
-            eta_min_func,
-            pco2_min_func,
-            "bo",
-            markersize=8,
-            label="Minimum functional point",
-            zorder=6,
-        )
-
-        # D. Maximum Phi Point (Unit Profit Margin Max)
-        max_phi_idx = np.unravel_index(
-            np.argmax(Phi_m, axis=None), Phi_m.shape
-        )
-        eta_max_Phi = ETA[max_phi_idx]
-        pco2_max_Phi = PCO2[max_phi_idx]
-        ax.plot(
-            eta_max_Phi,
-            pco2_max_Phi,
-            "g^",
-            markersize=9,
-            label=r"Maximum $\Phi$ point",
-            zorder=6,
-        )
-
         # ------------------------------------------
         # FORMATTING & LEGEND
         # ------------------------------------------
@@ -335,7 +354,7 @@ for _, row in plants.iterrows():
         ax.set_ylim(30, 150)
         ax.grid(True, linestyle="--", alpha=0.3)
 
-        # Deduplicate Legend Entries
+        # Clean legend
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
         ax.legend(
@@ -343,11 +362,11 @@ for _, row in plants.iterrows():
             by_label.keys(),
             loc="lower left",
             fontsize=8,
-            framealpha=0.9,
+            framealpha=0.95,
         )
 
     plt.suptitle(
-        f"Unified Optimization Analysis — {plant_name}",
+        f"{plant_name} Scenarios — Unified Critical & Optimal Analysis",
         fontsize=16,
         fontweight="bold",
         y=0.99,
