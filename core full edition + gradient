@@ -1,0 +1,356 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize_scalar
+
+# ==========================================
+# 1. INPUT DATA & PLANT COEFFICIENTS
+# ==========================================
+plants = pd.DataFrame(
+    {
+        "Plant": ["Slite", "Aalborg Portland", "Brevik", "Górażdże"],
+        "Qcapt": [1.80, 1.42, 0.40, 2.457],  # mln t/year
+        "P_elec": [36, 70, 51, 96],  # €/MWh
+        "P_CO2": [83, 83, 83, 83],  # €/t
+        "E_spec_Pelec_table": [32.40, 63.00, 45.90, 86.40],
+        "OPEX_spec": [30, 30, 30, 30],  # €/t
+    }
+)
+
+S = 0.0  # Carbon subsidy (€/t)
+eta_actual = 0.90  # Base capture efficiency
+
+# Compute plant specific baseline parameters
+plants["E_spec"] = plants["E_spec_Pelec_table"] / plants["P_elec"]
+plants["E0"] = plants["E_spec"] * (1 - eta_actual)
+
+# ==========================================
+# 2. GRID CONFIGURATION
+# ==========================================
+eta = np.linspace(0.10, 0.95, 300)
+Pco2 = np.linspace(30, 150, 300)
+ETA, PCO2 = np.meshgrid(eta, Pco2)
+
+
+# ==========================================
+# 3. REGRESSION MODELS
+# ==========================================
+def f_full_econometric(eta_grid, plant_row, var=0.15):
+    Qmax = plant_row["Qcapt"] / eta_actual
+    capacity = Qmax
+    labor_hours = 12000 * Qmax
+    total_cement_prod = eta_grid * Qmax * 1.5
+    num_kilns, pct_masonry, pct_4_or_other, pct_wet = 2.0, 0.15, 0.20, 0.05
+
+    beta0, beta1, beta2, beta3 = 0.80, -0.04, 0.02, 0.12
+    beta4, beta5, beta6, beta7 = 0.05, -0.08, 0.03, 0.15
+
+    E_i = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(total_cement_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    ref_prod = eta_actual * Qmax * 1.5
+    E_i_ref = (
+        beta0
+        + beta1 * np.log(capacity)
+        + beta2 * np.log(labor_hours)
+        + beta3 * np.log(ref_prod)
+        + beta4 * np.log(num_kilns)
+        + beta5 * pct_masonry
+        + beta6 * pct_4_or_other
+        + beta7 * pct_wet
+    )
+
+    target_E_spec = plant_row["E_spec"]
+    f_m = (
+        target_E_spec
+        * (E_i / E_i_ref)
+        * (1.0 + 0.45 * (eta_grid / eta_actual - 1.0))
+    )
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+def f_logarithmic(eta_grid, plant_row, var=0.15):
+    E0_val = plant_row["E0"]
+    base = 0.5 + 0.38 * np.log(eta_grid + 0.1)
+    scale = (E0_val / (1 - eta_actual)) / (
+        0.5 + 0.38 * np.log(eta_actual + 0.1)
+    )
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+def f_exponential(eta_grid, plant_row, var=0.15):
+    E0_val = plant_row["E0"]
+    base = 0.18 * np.exp(2.1 * eta_grid)
+    scale = (E0_val / (1 - eta_actual)) / (0.18 * np.exp(2.1 * eta_actual))
+    f_m = base * scale
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+def f_power_law(eta_grid, plant_row, beta=0.65, var=0.15):
+    E0_val = plant_row["E0"]
+    f_m = E0_val / ((1 - eta_grid) ** beta)
+    return f_m, f_m * (1 - var), f_m * (1 + var)
+
+
+scenarios = {
+    "Full Econometric": f_full_econometric,
+    "Logarithmic": f_logarithmic,
+    "Exponential": f_exponential,
+    "Power Law": f_power_law,
+}
+
+# ==========================================
+# 4. HELPER OPTIMIZATION FUNCTIONS
+# ==========================================
+
+
+def objective_profit(eta_val, p_co2_val, plant_row, model_func):
+    Qmax = plant_row["Qcapt"] / eta_actual
+    OPEX_fixed = plant_row["OPEX_spec"] * plant_row["Qcapt"]
+    P_elec_val = plant_row["P_elec"]
+
+    E_spec_m, _, _ = model_func(eta_val, plant_row)
+    OPEX_spec = OPEX_fixed / (eta_val * Qmax)
+
+    Phi_m = p_co2_val + S - (E_spec_m * P_elec_val) - OPEX_spec
+    return -(eta_val * Qmax * Phi_m)
+
+
+def find_breakeven_eta(plant_row, model_func, target_pco2=83.0):
+    def abs_profit(e):
+        return abs(objective_profit(e, target_pco2, plant_row, model_func))
+
+    res = minimize_scalar(abs_profit, bounds=(0.10, 0.95), method="bounded")
+    return res.x if res.fun < 1e-2 else None
+
+
+# ==========================================
+# 5. CONTOUR & GRADIENT VECTOR MAP ENGINE
+# ==========================================
+for _, row in plants.iterrows():
+    plant_name = row["Plant"]
+    Qmax = row["Qcapt"] / eta_actual
+    P_elec_val = row["P_elec"]
+    OPEX_fixed = row["OPEX_spec"] * row["Qcapt"]
+    pco2_fixed = row["P_CO2"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+
+    for sc_idx, (sc_name, sc_func) in enumerate(scenarios.items()):
+        ax = axes[sc_idx]
+
+        # Calculate profit grid and margins
+        E_spec_m, E_spec_low, E_spec_high = sc_func(ETA, row)
+        OPEX_spec_mesh = OPEX_fixed / (ETA * Qmax)
+
+        Phi_m = PCO2 + S - (E_spec_m * P_elec_val) - OPEX_spec_mesh
+        F_m = ETA * Qmax * Phi_m
+
+        # ------------------------------------------
+        # 1. CONTOUR MAP
+        # ------------------------------------------
+        cf = ax.contourf(ETA, PCO2, F_m, levels=200, cmap="plasma")
+        fig.colorbar(
+            cf,
+            ax=ax,
+            label=r"$\text{Profit } F \text{ (Mln €/yr)}$",
+            fraction=0.046,
+            pad=0.04,
+        )
+
+        # ------------------------------------------
+        # 2. GRADIENT VECTOR FIELD (∇F)
+        # ------------------------------------------
+        dF_deta, dF_dPco2 = np.gradient(F_m, eta, Pco2, axis=(1, 0))
+
+        step = 14
+        eta_sub = ETA[::step, ::step]
+        pco2_sub = PCO2[::step, ::step]
+        u_sub = dF_deta[::step, ::step]
+        v_sub = dF_dPco2[::step, ::step]
+
+        magnitude = np.hypot(u_sub, v_sub)
+        magnitude_safe = np.where(magnitude == 0, 1.0, magnitude)
+
+        ax.quiver(
+            eta_sub,
+            pco2_sub,
+            u_sub / magnitude_safe,
+            v_sub / magnitude_safe,
+            magnitude,
+            cmap="cool",
+            alpha=0.50,
+            scale=30,
+            width=0.003,
+            pivot="mid",
+            label=r"Gradient Vector Field $\nabla F$",
+        )
+
+        # ------------------------------------------
+        # 3. ZERO-PROFIT CURVE & VARIATION BAND
+        # ------------------------------------------
+        E_spec_eta, E_low_eta, E_high_eta = sc_func(eta, row)
+        OPEX_spec_eta = OPEX_fixed / (eta * Qmax)
+
+        pco2_zero_mid = (E_spec_eta * P_elec_val) + OPEX_spec_eta - S
+        pco2_zero_low = (E_low_eta * P_elec_val) + OPEX_spec_eta - S
+        pco2_zero_high = (E_high_eta * P_elec_val) + OPEX_spec_eta - S
+
+        ax.fill_between(
+            eta,
+            pco2_zero_low,
+            pco2_zero_high,
+            color="grey",
+            alpha=0.45,
+            label=r"Regression Variation Zone ($\pm 15\%$)",
+        )
+        ax.plot(
+            eta, pco2_zero_low, color="cyan", linestyle="--", linewidth=1.2
+        )
+        ax.plot(
+            eta, pco2_zero_high, color="cyan", linestyle="--", linewidth=1.2
+        )
+        ax.plot(eta, pco2_zero_mid, color="blue", linewidth=2.5)
+
+        # ------------------------------------------
+        # 4. FIXED CARBON PRICE BASELINE
+        # ------------------------------------------
+        ax.axhline(
+            pco2_fixed,
+            color="black",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"Fixed $P_{{CO2}} = {int(pco2_fixed)}$ €/t",
+        )
+
+        # ------------------------------------------
+        # 5. SPECIAL POINTS COMPUTATION & PLOTTING
+        # ------------------------------------------
+        # A. Optimizer Point (At P_CO2 = 83)
+        res = minimize_scalar(
+            objective_profit,
+            bounds=(0.10, 0.95),
+            args=(pco2_fixed, row, sc_func),
+            method="bounded",
+        )
+        eta_star = res.x
+        F_star = -res.fun
+
+        ax.plot(
+            eta_star,
+            pco2_fixed,
+            "r*",
+            markersize=13,
+            label=f"Optimizer: η*={eta_star:.3f}, F={F_star:.2f} M€",
+            zorder=6,
+        )
+        ax.axvline(
+            eta_star, color="red", linestyle=":", linewidth=1.5, zorder=5
+        )
+        ax.annotate(
+            f"η*={eta_star:.3f}\nF={F_star:.2f}M€",
+            xy=(eta_star, pco2_fixed),
+            xytext=(eta_star + 0.02, pco2_fixed + 6),
+            fontsize=8,
+            color="red",
+            weight="bold",
+            bbox=dict(
+                boxstyle="round,pad=0.2", fc="white", ec="red", alpha=0.85
+            ),
+        )
+
+        # B. Break-Even Point (At P_CO2 = 83)
+        be_eta = find_breakeven_eta(row, sc_func, pco2_fixed)
+        if be_eta is not None:
+            ax.plot(
+                be_eta,
+                pco2_fixed,
+                "go",
+                markersize=8,
+                label=f"Break-Even (P=83): η={be_eta:.3f}",
+                zorder=6,
+            )
+            ax.annotate(
+                f"BE η={be_eta:.3f}",
+                xy=(be_eta, pco2_fixed),
+                xytext=(be_eta - 0.12, pco2_fixed - 8),
+                fontsize=8,
+                color="darkgreen",
+                weight="bold",
+                bbox=dict(
+                    boxstyle="round,pad=0.2",
+                    fc="white",
+                    ec="green",
+                    alpha=0.85,
+                ),
+            )
+
+        # C. Minimum Functional Point (Global min on zero-profit curve)
+        min_func_idx = np.argmin(pco2_zero_mid)
+        eta_min_func = eta[min_func_idx]
+        pco2_min_func = pco2_zero_mid[min_func_idx]
+        ax.plot(
+            eta_min_func,
+            pco2_min_func,
+            "bo",
+            markersize=8,
+            label="Minimum functional point",
+            zorder=6,
+        )
+
+        # D. Maximum Phi Point (Unit Profit Margin Max)
+        max_phi_idx = np.unravel_index(
+            np.argmax(Phi_m, axis=None), Phi_m.shape
+        )
+        eta_max_Phi = ETA[max_phi_idx]
+        pco2_max_Phi = PCO2[max_phi_idx]
+        ax.plot(
+            eta_max_Phi,
+            pco2_max_Phi,
+            "g^",
+            markersize=9,
+            label=r"Maximum $\Phi$ point",
+            zorder=6,
+        )
+
+        # ------------------------------------------
+        # FORMATTING & LEGEND
+        # ------------------------------------------
+        ax.set_title(
+            f"{plant_name}: {sc_name}", fontsize=12, fontweight="bold"
+        )
+        ax.set_xlabel(r"Capture efficiency $\eta$")
+        ax.set_ylabel(r"$\text{CO}_2$ price, €/t")
+        ax.set_xlim(0.1, 0.95)
+        ax.set_ylim(30, 150)
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+        # Deduplicate Legend Entries
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="lower left",
+            fontsize=8,
+            framealpha=0.9,
+        )
+
+    plt.suptitle(
+        f"Unified Optimization Analysis — {plant_name}",
+        fontsize=16,
+        fontweight="bold",
+        y=0.99,
+    )
+    plt.tight_layout()
+    plt.show()
